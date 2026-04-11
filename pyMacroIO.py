@@ -12,20 +12,12 @@ labour hiring and firing, and hooks for output and input-availability shocks.
 import copy
 import logging
 import pickle
-import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Tuple, Dict, List, Optional, Callable, Any
 
 import numpy as np
 import matplotlib.pyplot as plt
-
-# Numerical warnings (e.g. divide-by-zero in IO coefficients) are suppressed module-wide.
-# Division by zero and invalid values are expected in coefficient and capacity calculations;
-# results are handled via np.where/out and clipping. Suppression avoids noisy logs during
-# long runs. Suppression may be scoped to specific blocks (e.g. warnings.catch_warnings()) if
-# required for debugging.
-warnings.filterwarnings('ignore')
 
 logger = logging.getLogger(__name__)
 if not logger.handlers:
@@ -41,7 +33,7 @@ if not logger.handlers:
 #
 # Default calibration (used in model logic)
 # -----------------------------------------
-# Default household savings rate (fraction of income) when not set by config.
+# Fallback household savings rate used only when a baseline rate cannot be inferred from data.
 DEFAULT_SAVINGS_RATE = 0.05
 
 # Hire/fire capacity bounds. Base capacity is (1 - delta) clipped to [DELTA_FLOOR, DELTA_CAP].
@@ -57,12 +49,13 @@ FIRING_SPEED_DAMPING = 0.5
 # Consumption demand floors in findemand_cd, expressed as a ratio of baseline consumption.
 CONSUMPTION_FLOOR_RATIO = 0.5
 CONSUMPTION_FLOOR_LABOUR_RATIO = 0.2
+HOUSEHOLD_CLOSURE_MODES = ("return_to_base", "scarred")
+PRODUCTION_FUNCTIONS = ("leontief", "leontief.adapted", "linear", "ces")
+FIRM_PRIORITY_MODES = ("no", "yes")
 
-# Threshold used in producing_x: inputs with A_essential > this value
-# are classified as essential; inputs with A_essential == this value are classified as important.
-# Weight used when combining important-input constraint with capacity in adapted Leontief.
+# Threshold used in producing_x: inputs with A_essential above this value
+# are classified as essential in adapted Leontief.
 ESSENTIAL_INPUT_THRESHOLD = 0.5
-IMPORTANT_INPUT_CAPACITY_WEIGHT = 0.5
 
 # Tolerances used when checking row and value-added identity in the IO balance.
 ROW_IDENTITY_ATOL = 1e-10
@@ -80,6 +73,7 @@ GAMMA_FIRE_MIN = 0.1
 GAMMA_FIRE_MAX = 0.8
 TAU_MIN = 0.5
 TAU_MAX = 5.0
+CES_ELASTICITY_DEFAULT = 1.5
 
 # Large finite value used when replacing inf/nan in producing_x for numerical stability.
 NUMERIC_LARGE = 1e6
@@ -100,14 +94,15 @@ class ModelConfig:
     benefits: float = 0.1
     c_other_coef: float = 0.1
     prod_function: str = "leontief.adapted"
-    cons_function: str = "muellbauer"
     hiringfiring: bool = True
     firm_priority: str = "no"
     inventory_days: Optional[np.ndarray] = None
     inventory_days_daily: float = 2.0
     inventory_days_other: float = 2.0
-    diagnostics: bool = False
     data_path: str = "data/example_data.pkl"
+    savings_rate: Optional[float] = None
+    ces_elasticity: float = CES_ELASTICITY_DEFAULT
+    household_closure_mode: str = "return_to_base"
 
     def __post_init__(self) -> None:
         """n_periods and time_frequency are validated; ValueError is raised if invalid."""
@@ -116,6 +111,23 @@ class ModelConfig:
         if self.time_frequency not in ("daily", "quarterly"):
             raise ValueError(
                 f"time_frequency must be 'daily' or 'quarterly'; got {self.time_frequency!r}"
+            )
+        if self.savings_rate is not None and not (0 <= self.savings_rate < 1):
+            raise ValueError(f"savings_rate must be in [0, 1); got {self.savings_rate}")
+        if self.ces_elasticity <= 0:
+            raise ValueError(f"ces_elasticity must be positive; got {self.ces_elasticity}")
+        if self.household_closure_mode not in HOUSEHOLD_CLOSURE_MODES:
+            raise ValueError(
+                f"household_closure_mode must be one of {HOUSEHOLD_CLOSURE_MODES}; "
+                f"got {self.household_closure_mode!r}"
+            )
+        if self.prod_function not in PRODUCTION_FUNCTIONS:
+            raise ValueError(
+                f"prod_function must be one of {PRODUCTION_FUNCTIONS}; got {self.prod_function!r}"
+            )
+        if self.firm_priority not in FIRM_PRIORITY_MODES:
+            raise ValueError(
+                f"firm_priority must be one of {FIRM_PRIORITY_MODES}; got {self.firm_priority!r}"
             )
 
     def clone(self) -> "ModelConfig":
@@ -135,6 +147,15 @@ ENABLE_PLOTTING = True
 ENABLE_INPUT_AVAILABILITY_SHOCK_PLOT = True
 # Number of Monte Carlo runs used for uncertainty bands in demo plots.
 MC_PLOT_SIMULATIONS = 50
+# Default headline calibration for the example input-availability scenario.
+INPUT_SHOCK_DEFAULT_REDUCTION_PCT = 0.3
+INPUT_SHOCK_DEFAULT_DURATION = 3
+INPUT_SHOCK_DEFAULT_START = 2
+INPUT_SHOCK_DEFAULT_INVENTORY_DAYS = 5.0
+INPUT_SHOCK_STRESS_REDUCTION_PCT = 0.5
+INPUT_SHOCK_STRESS_DURATION = 3
+INPUT_SHOCK_STRESS_START = 2
+INPUT_SHOCK_STRESS_INVENTORY_DAYS = 1.0
 
 
 # -----------------------------------------------------------------------------
@@ -157,6 +178,39 @@ class ScenarioRunResult:
     scenario: Scenario
     model: "SingleRegionInputOutputModel"
     results: Dict[str, Any]
+
+
+@dataclass(frozen=True)
+class ConsumptionShockSpec:
+    """A consumption-shock specification used for examples, sensitivity runs, or stress tests."""
+
+    intensity: float = 0.2
+    duration: int = 3
+    start: int = 2
+    tier: str = "example"
+
+
+@dataclass(frozen=True)
+class InputAvailabilityShockSpec:
+    """An input-availability shock specification used for examples, sensitivity runs, or stress tests."""
+
+    reduction_pct: float = INPUT_SHOCK_DEFAULT_REDUCTION_PCT
+    duration: int = INPUT_SHOCK_DEFAULT_DURATION
+    start: int = INPUT_SHOCK_DEFAULT_START
+    inventory_days: Optional[np.ndarray] = INPUT_SHOCK_DEFAULT_INVENTORY_DAYS
+    input_sector_label: Optional[str] = None
+    tier: str = "example"
+
+
+CONSUMPTION_EXAMPLE_SHOCK_SPEC = ConsumptionShockSpec()
+INPUT_AVAILABILITY_EXAMPLE_SHOCK_SPEC = InputAvailabilityShockSpec()
+INPUT_AVAILABILITY_STRESS_SHOCK_SPEC = InputAvailabilityShockSpec(
+    reduction_pct=INPUT_SHOCK_STRESS_REDUCTION_PCT,
+    duration=INPUT_SHOCK_STRESS_DURATION,
+    start=INPUT_SHOCK_STRESS_START,
+    inventory_days=INPUT_SHOCK_STRESS_INVENTORY_DAYS,
+    tier="stress",
+)
 
 
 # -----------------------------------------------------------------------------
@@ -205,13 +259,21 @@ class ScenarioManager:
     @staticmethod
     def compare_to_baseline(run: ScenarioRunResult, baseline: ScenarioRunResult) -> Dict[str, np.ndarray]:
         """Percentage deviations of GDP and realised consumption from the baseline are returned as arrays (keys 'gdp_pct' and 'consumption_pct')."""
+        def safe_pct_change(current: np.ndarray, reference: np.ndarray) -> np.ndarray:
+            pct = np.full_like(current, np.nan, dtype=np.float64)
+            nonzero_reference = reference != 0
+            pct[nonzero_reference] = (current[nonzero_reference] / reference[nonzero_reference] - 1) * 100
+            zero_and_equal = (~nonzero_reference) & np.isclose(current, reference)
+            pct[zero_and_equal] = 0.0
+            return pct
+
         comparison: Dict[str, np.ndarray] = {}
         baseline_gdp = baseline.results['gdp']
         scenario_gdp = run.results['gdp']
-        comparison['gdp_pct'] = (scenario_gdp / baseline_gdp - 1) * 100
+        comparison['gdp_pct'] = safe_pct_change(scenario_gdp, baseline_gdp)
         baseline_realised_cons = np.sum(baseline.results['realised_consumption'], axis=0)
         scenario_realised_cons = np.sum(run.results['realised_consumption'], axis=0)
-        comparison['consumption_pct'] = (scenario_realised_cons / baseline_realised_cons - 1) * 100
+        comparison['consumption_pct'] = safe_pct_change(scenario_realised_cons, baseline_realised_cons)
         return comparison
 
 
@@ -243,30 +305,29 @@ class SingleRegionInputOutputModel:
         
         self._calculate_time_step_parameters()
 
-        def _resolve_array(value: Optional[np.ndarray], fallback: List[float]) -> np.ndarray:
+        def _resolve_array(value: Optional[np.ndarray], fallback: float) -> np.ndarray:
             if value is None:
-                return np.array(fallback, dtype=np.float64)
-            arr = np.asarray(value, dtype=np.float64)
-            return arr
+                return np.array([fallback], dtype=np.float64)
+            return np.atleast_1d(np.asarray(value, dtype=np.float64))
 
-        self.tau = _resolve_array(config.tau, [1.8, 2.5, 2.2])
-        self.gamma_hire = _resolve_array(config.gamma_hire, [0.25, 0.35, 0.30])
-        self.gamma_fire = _resolve_array(config.gamma_fire, [0.35, 0.45, 0.40])
+        self.tau = _resolve_array(config.tau, DEFAULT_TAU)
+        self.gamma_hire = _resolve_array(config.gamma_hire, DEFAULT_GAMMA_HIRE)
+        self.gamma_fire = _resolve_array(config.gamma_fire, DEFAULT_GAMMA_FIRE)
         self.benefits = config.benefits
         
         self.c_other_coef = config.c_other_coef
+        self.ces_elasticity = config.ces_elasticity
+        self.household_closure_mode = config.household_closure_mode
         
         self.prod_function = config.prod_function
-        self.cons_function = config.cons_function
         self.hiringfiring = config.hiringfiring
         self.firm_priority = config.firm_priority
-        self.diagnostics_enabled = config.diagnostics
         self.inventory_days_config = config.inventory_days
         self.inventory_days_daily = config.inventory_days_daily
         self.inventory_days_other = config.inventory_days_other
         
-        self._validate_parameters()
         self._initialize_data()
+        self._validate_parameters()
     
     def _load_data_dict(self, path: Path) -> dict:
         """The data dictionary is loaded from the given path (Python pickle format)."""
@@ -279,8 +340,8 @@ class SingleRegionInputOutputModel:
             return pickle.load(f)
 
     def _initialize_essential_inputs(self) -> None:
-        """Essential-input indicators are initialised from the IO matrix when production is leontief.adapted or ces; otherwise A_essential is set to None."""
-        if self.prod_function in ["leontief.adapted", "ces"]:
+        """Essential-input indicators are initialised from the IO matrix when production is leontief.adapted; otherwise A_essential is set to None."""
+        if self.prod_function == "leontief.adapted":
             temp_mc = MonteCarloUncertaintyAnalysis(self, n_simulations=1)
             self.A_essential = temp_mc.estimate_essential_inputs_from_io_data(
                 self.A, method='combined_linkage'
@@ -301,6 +362,109 @@ class SingleRegionInputOutputModel:
             days = np.full(self.N, default_days, dtype=np.float64)
         
         return days
+
+    def _expand_sector_parameter(self, value: np.ndarray, default_value: float, name: str) -> np.ndarray:
+        """A scalar or sector-length array is expanded to length N; invalid lengths raise ValueError."""
+        arr = np.atleast_1d(np.asarray(value, dtype=np.float64))
+        if arr.size == 0:
+            return np.full(self.N, default_value, dtype=np.float64)
+        if arr.size == 1:
+            return np.full(self.N, float(arr.squeeze()), dtype=np.float64)
+        if arr.size == self.N:
+            return arr.astype(np.float64)
+        raise ValueError(f"{name} length ({arr.size}) does not match N ({self.N})")
+
+    def _validate_savings_rate_value(self, savings_rate: float) -> float:
+        """A validated savings rate in [0, 1) is returned."""
+        rate = float(savings_rate)
+        if not 0 <= rate < 1:
+            raise ValueError(f"savings_rate must be in [0, 1); got {savings_rate}")
+        return rate
+
+    def _extra_household_expenditure(self, consumption_total: float) -> float:
+        """Other household outlays implied by c_other_coef are returned."""
+        return self.c_other_coef / (1 - self.c_other_coef) * consumption_total
+
+    def _infer_base_savings_rate(self, consumption_total: float, household_income: float) -> float:
+        """The savings rate implied by base-year household income and observed spending is returned."""
+        total_spending = float(consumption_total) + self._extra_household_expenditure(consumption_total)
+        disposable_income = max(float(household_income), 1e-9)
+        implied_rate = 1 - total_spending / disposable_income
+        return self._validate_savings_rate_value(np.clip(implied_rate, 0.0, 1.0 - 1e-9))
+
+    def _household_income(self, labour_income_total: float, profit_income_total: float) -> float:
+        """Disposable household income is returned from adjusted labour income and profits."""
+        baseline_labour_income = float(np.sum(self.l0))
+        adjusted_labour_income = self.benefits * baseline_labour_income + (1 - self.benefits) * float(labour_income_total)
+        return max(adjusted_labour_income + float(profit_income_total), 1e-9)
+
+    def _household_consumption_capacity(
+        self,
+        household_income: float,
+        household_wealth: float = 0.0,
+        savings_rate: Optional[float] = None
+    ) -> float:
+        """Maximum household consumption consistent with available resources and the savings rule is returned."""
+        rate = self.savings_rate if savings_rate is None else self._validate_savings_rate_value(savings_rate)
+        available_resources = max(float(household_income) + float(household_wealth), 1e-9)
+        total_household_spending = (1 - rate) * available_resources
+        return max((1 - self.c_other_coef) * total_household_spending, 1e-9)
+
+    def _household_income_signal_for_period(self, household_income_prev: float, xit: float) -> float:
+        """The beginning-of-period household income signal is returned for the selected closure mode."""
+        if self.household_closure_mode == "scarred":
+            return max(float(household_income_prev), 1e-9)
+        return max(self.base_household_income * float(xit), 1e-9)
+
+    def _set_household_baseline(self, cons_vec_template: np.ndarray) -> None:
+        """Household shares, baseline income, and baseline consumption are initialised consistently."""
+        household_consumption_template = np.asarray(cons_vec_template, dtype=np.float64)
+        template_total = float(np.sum(household_consumption_template))
+        if template_total > 0:
+            self.household_consumption_shares = household_consumption_template / template_total
+        else:
+            self.household_consumption_shares = np.full(self.N, 1 / self.N, dtype=np.float64)
+
+        self.c0 = household_consumption_template.copy()
+        self.base_consumption_total = float(np.sum(self.c0))
+        self.base_household_income = self._household_income(np.sum(self.l0), np.sum(self.profits0))
+        if self.config.savings_rate is None:
+            self.savings_rate = self._infer_base_savings_rate(self.base_consumption_total, self.base_household_income)
+        else:
+            self.savings_rate = self._validate_savings_rate_value(self.config.savings_rate)
+        self.base_consumption_total = float(np.sum(self.c0))
+        self.theta_ = np.repeat(self.household_consumption_shares[:, np.newaxis], self.TT, axis=1)
+        self.mpc = self.base_consumption_total / max(self.base_household_income, 1e-9)
+        self.base_household_savings = (
+            self.base_household_income
+            - self.base_consumption_total
+            - self._extra_household_expenditure(self.base_consumption_total)
+        )
+
+    def _ces_output_constraint(self, input_capacity: np.ndarray, weights: np.ndarray) -> float:
+        """A CES-style output bound from per-input capacities and technical-coefficient weights is returned."""
+        valid = np.isfinite(input_capacity) & (weights > 0)
+        if not np.any(valid):
+            return np.inf
+        q = np.maximum(input_capacity[valid], 0.0)
+        w = weights[valid]
+        w = w / np.sum(w)
+        sigma = self.ces_elasticity
+        if np.isclose(sigma, 1.0):
+            safe_q = np.maximum(q, 1e-12)
+            return float(np.exp(np.sum(w * np.log(safe_q))))
+        rho = (sigma - 1.0) / sigma
+        aggregate = np.sum(w * np.power(q, rho))
+        return float(np.power(max(aggregate, 0.0), 1.0 / rho))
+
+    def _period_output_constraints(self, t: int) -> np.ndarray:
+        """The effective output constraints for period t, including supplier-side shocks, are returned."""
+        output_constraint = np.array(self.output_constraint_[:, t], copy=True, dtype=np.float64)
+        if t in self.input_availability_shocks_:
+            for supplier_idx, reduction_pct in self.input_availability_shocks_[t].items():
+                shocked_capacity = (1 - reduction_pct) * self.x0[supplier_idx]
+                output_constraint[supplier_idx] = min(output_constraint[supplier_idx], shocked_capacity)
+        return output_constraint
 
     def _calculate_time_step_parameters(self) -> None:
         """Time-step length (dt) and consumption persistence (rho0, rho1) are set from time_frequency."""
@@ -339,10 +503,9 @@ class SingleRegionInputOutputModel:
         if self.Z0.ndim != 2 or self.Z0.shape[0] != self.Z0.shape[1]:
             raise ValueError(f"Z matrix must be square. Got shape {self.Z0.shape}")
         self.N = self.Z0.shape[0]
-        if len(self.tau) != self.N:
-            self.tau = np.full(self.N, DEFAULT_TAU)
-            self.gamma_hire = np.full(self.N, DEFAULT_GAMMA_HIRE)
-            self.gamma_fire = np.full(self.N, DEFAULT_GAMMA_FIRE)
+        self.tau = self._expand_sector_parameter(self.tau, DEFAULT_TAU, "tau")
+        self.gamma_hire = self._expand_sector_parameter(self.gamma_hire, DEFAULT_GAMMA_HIRE, "gamma_hire")
+        self.gamma_fire = self._expand_sector_parameter(self.gamma_fire, DEFAULT_GAMMA_FIRE, "gamma_fire")
         cons_vec = np.asarray(data["cons_vec"], dtype=np.float64)
         gov_vec = np.asarray(data["gov_vec"], dtype=np.float64)
         inv_vec = np.asarray(data["inv_vec"], dtype=np.float64)
@@ -406,7 +569,6 @@ class SingleRegionInputOutputModel:
             self.imp_share = np.divide(
                 self.imp0, self.x0, out=np.zeros_like(self.imp0), where=self.x0 != 0
             )
-        self.savings_rate = DEFAULT_SAVINGS_RATE
         self.n = self._resolve_inventory_days_vector()
         self.delta_ = np.zeros((self.N, self.TT))
         self.epsilon_ = np.zeros(self.TT)
@@ -415,11 +577,7 @@ class SingleRegionInputOutputModel:
         self.input_availability_shocks_ = {}
         self.rationing_shocks_ = {}
 
-        self.c0 = cons_vec.copy()
-        self.theta_ = np.zeros((self.N, self.TT))
-        for t in range(self.TT):
-            denom = np.sum(self.c0)
-            self.theta_[:, t] = self.c0 / denom if denom != 0 else np.zeros(self.N)
+        self._set_household_baseline(cons_vec)
         self.consumer_taxes_total = float(data["consumer_taxes_total"])
         self.fd_imports_totals = dict(data["fd_imports_totals"])
         self.fd_government_ = np.zeros((self.N, self.TT))
@@ -432,7 +590,6 @@ class SingleRegionInputOutputModel:
             self.fd_inventories_[:, t] = invnt_vec
             self.fd_exports_[:, t] = exp_vec
         self.fd_other_ = np.zeros((self.N, self.TT))
-        self.mpc = np.sum(self.c0) / np.sum(self.l0)
 
     # --- Labour, demand, orders, production (single-period building blocks) ---
     def hire_fire(self, t: int, l_: np.ndarray, x_: np.ndarray,
@@ -444,52 +601,64 @@ class SingleRegionInputOutputModel:
         base_capacity = l_[:, 0] * np.clip(1 - delta_[:, t], DELTA_FLOOR, DELTA_CAP)
         max_capacity = l_[:, 0] * CAPACITY_MAX_SCALE
         min_capacity = l_[:, 0] * CAPACITY_MIN_SCALE
-        new_lcap = np.maximum(np.maximum(base_capacity, min_capacity), l_[:, t-1])
+        disruption_active = delta_[:, t] > 0
+        upper_capacity = np.where(
+            disruption_active,
+            np.minimum(max_capacity, np.maximum(base_capacity, l_[:, t-1])),
+            max_capacity
+        )
         labor_share = np.divide(l_[:, 0], x_[:, 0], out=np.zeros_like(l_[:, 0]), where=x_[:, 0] != 0)
-        potential_capacity = np.minimum(prod_constraints[:, 1], prod_constraints[:, 2])
-        slack = potential_capacity - prod_constraints[:, 0]
-        hire_ix = (slack > 0).astype(bool)
+        desired_output = np.min(prod_constraints[:, 1:4], axis=1)
+        desired_l = np.clip(labor_share * desired_output, min_capacity, upper_capacity)
+        gap = desired_l - l_[:, t-1]
+        hire_ix = gap > 0
         gam = np.where(hire_ix, self.gamma_hire, self.gamma_fire * FIRING_SPEED_DAMPING)
-        adjustment = gam * labor_share * slack
+        adjustment = gam * gap
         new_l = l_[:, t-1] + adjustment
-        new_l = np.clip(new_l, min_capacity, new_lcap)
+        new_l = np.clip(new_l, min_capacity, upper_capacity)
         
         
         return new_l
     
-    def findemand_cd(self, t: int, theta: np.ndarray, Cdt: float,
-                    xit: float, l_: np.ndarray, eps: float) -> Tuple[float, np.ndarray]:
-        """Consumption demand is updated from persistence, labour income, and expectations; the new aggregate (Cdt_new) and the sectoral demand vector cd are returned. Floors are applied as per CONSUMPTION_FLOOR_*."""
-        l1 = np.sum(l_[:, 0])
-        lt = np.sum(l_[:, t])
-        lt = self.benefits * l1 + (1 - self.benefits) * lt
-        baseline_ct = max(self.mpc * l1, 1.0)
-        logCt = np.log(max(Cdt, baseline_ct * CONSUMPTION_FLOOR_RATIO))
-        loglt = np.log(max(self.mpc * lt, baseline_ct * CONSUMPTION_FLOOR_LABOUR_RATIO))
-        logltp = np.log(max(self.mpc * l1 * xit, baseline_ct))
-        Cdt_new = np.exp(self.rho1 * logCt + self.rho0/2 * loglt + self.rho0/2 * logltp)
-        Cdt_new = max(Cdt_new, baseline_ct * CONSUMPTION_FLOOR_RATIO)
+    def findemand_cd(
+        self,
+        theta: np.ndarray,
+        Cdt: float,
+        xit: float,
+        household_income_signal: float,
+        eps: float
+    ) -> Tuple[float, np.ndarray]:
+        """Consumption demand is updated from the configured household closure, persistence, and expectations."""
+        current_capacity = self._household_consumption_capacity(max(float(household_income_signal), 1e-9))
+        expected_capacity = self._household_consumption_capacity(max(self.base_household_income * xit, 1e-9))
+        baseline_ct = max(self.base_consumption_total, 1.0)
+        if self.household_closure_mode == "scarred":
+            log_prev_ratio = np.log(max(Cdt / baseline_ct, CONSUMPTION_FLOOR_RATIO))
+        else:
+            log_prev_ratio = 0.0
+        log_current_ratio = np.log(max(current_capacity / baseline_ct, CONSUMPTION_FLOOR_LABOUR_RATIO, 1e-9))
+        log_expected_ratio = np.log(max(expected_capacity / baseline_ct, CONSUMPTION_FLOOR_RATIO, 1e-9))
+        Cdt_new = baseline_ct * np.exp(self.rho1 * log_prev_ratio + self.rho0 / 2 * log_current_ratio + self.rho0 / 2 * log_expected_ratio)
+        floor_consumption = min(baseline_ct * CONSUMPTION_FLOOR_RATIO, current_capacity)
+        Cdt_new = min(max(Cdt_new, floor_consumption), current_capacity)
         cd = theta * Cdt_new * (1 - eps)
         
         return Cdt_new, cd
     
     def orders_O(self, A: np.ndarray, d: np.ndarray, tau: np.ndarray,
                  S_tar: np.ndarray, S: np.ndarray) -> np.ndarray:
-        """Intermediate orders (O) are computed from the technical coefficients, demand, target and actual inventories, and adjustment speed tau; non-negative values are returned."""
-        O = A @ np.diag(d) + (S_tar - S) / tau[:, np.newaxis]
+        """Intermediate orders (O) combine current-use demand with damped replenishment toward the inventory target."""
+        d = np.nan_to_num(d, nan=0.0, posinf=NUMERIC_LARGE, neginf=0.0)
+        S_tar = np.nan_to_num(S_tar, nan=0.0, posinf=NUMERIC_LARGE, neginf=0.0)
+        S = np.nan_to_num(S, nan=0.0, posinf=NUMERIC_LARGE, neginf=0.0)
+        use_orders = A * d[np.newaxis, :]
+        restock_gap = np.maximum(S_tar - S, 0.0)
+        O = use_orders + restock_gap / tau[:, np.newaxis]
         return np.maximum(O, 0)
 
     def producing_x(self, prod_f: str, A_essential: Optional[np.ndarray], xcap0: np.ndarray,
                     l_: np.ndarray, S: np.ndarray, A: np.ndarray, d: np.ndarray, t: int) -> Dict:
-        """Feasible output per sector is computed from labour capacity, input availability (Leontief/adapted/CES/linear), demand, and output_constraint_; a dict with 'output' and 'output.constraints' is returned."""
-        # Effective inventories are computed; input-availability shocks scale usable stock for the period
-        if t in self.input_availability_shocks_:
-            S_eff = np.array(S, copy=True, dtype=np.float64)
-            for input_sector_idx, reduction_pct in self.input_availability_shocks_[t].items():
-                S_eff[input_sector_idx, :] = S_eff[input_sector_idx, :] * (1.0 - reduction_pct)
-        else:
-            S_eff = S
-        
+        """Feasible output per sector is computed from labour capacity, beginning-of-period inventories, demand, and supplier-side output constraints."""
         with np.errstate(divide='ignore', invalid='ignore'):
             xcap = np.divide(l_[:, t], l_[:, 0], out=np.full_like(l_[:, t], np.inf), where=l_[:, 0] != 0) * xcap0
             xcap[l_[:, 0] == 0] = np.inf
@@ -498,71 +667,39 @@ class SingleRegionInputOutputModel:
             xinp = np.zeros(self.N)
             for k in range(self.N):
                 if prod_f == "leontief.adapted" and A_essential is not None:
-                    essential = A_essential[:, k] > ESSENTIAL_INPUT_THRESHOLD
-                    if np.any(essential):
-                        essential_nonzero = essential & (A[:, k] > 0)
-                        if np.any(essential_nonzero):
-                            xinp[k] = np.min(S_eff[essential_nonzero, k] / A[essential_nonzero, k])
-                        else:
-                            xinp[k] = np.inf
+                    input_capacity = np.divide(S[:, k], A[:, k], out=np.full(self.N, np.inf), where=A[:, k] > 0)
+                    essential = (A_essential[:, k] > ESSENTIAL_INPUT_THRESHOLD) & (A[:, k] > 0)
+                    nonessential = (A_essential[:, k] <= ESSENTIAL_INPUT_THRESHOLD) & (A[:, k] > 0)
+                    essential_constraint = np.min(input_capacity[essential]) if np.any(essential) else np.inf
+                    if np.any(nonessential):
+                        weights = A[nonessential, k]
+                        adaptable_constraint = float(np.average(input_capacity[nonessential], weights=weights))
                     else:
-                        xinp[k] = np.inf
-                    # Important inputs (A_essential == threshold) are used when A_essential is
-                    # non-binary (e.g. ternary 0/0.5/1); for binary 0/1 from combined_linkage
-                    # this branch is unused.
-                    important = A_essential[:, k] == ESSENTIAL_INPUT_THRESHOLD
-                    if np.any(important):
-                        important_nonzero = important & (A[:, k] > 0)
-                        if np.any(important_nonzero):
-                            xinp_important = np.min((S_eff[important_nonzero, k] / A[important_nonzero, k]) * IMPORTANT_INPUT_CAPACITY_WEIGHT + xcap0[k] / 2)
-                            xinp[k] = min(xinp_important, xinp[k])
+                        adaptable_constraint = np.inf
+                    xinp[k] = min(essential_constraint, adaptable_constraint)
                 else:
                     essential = A[:, k] > 0
                     if np.any(essential):
-                        xinp[k] = np.min(S_eff[essential, k] / A[essential, k])
+                        xinp[k] = np.min(S[essential, k] / A[essential, k])
                     else:
                         xinp[k] = np.inf
         
         elif prod_f == "linear":
             inpshare = np.sum(A, axis=0)
-            totinp = np.sum(S_eff, axis=0)
+            totinp = np.sum(S, axis=0)
             xinp = np.where(inpshare > 0, totinp / inpshare, np.inf)
         elif prod_f == "ces":
-            if A_essential is None:
-                raise ValueError("A_essential must be initialised for CES production function")
             xinp = np.full(self.N, np.inf, dtype=np.float64)
             for k in range(self.N):
-                idC = A_essential[:, k] > ESSENTIAL_INPUT_THRESHOLD
-                idIMP = A_essential[:, k] == ESSENTIAL_INPUT_THRESHOLD  # unused when binary 0/1
-                idNC = A_essential[:, k] == 0
-
-                if np.any(idC) and np.any(idNC):
-                    Arel = A[:, k]
-                    Srel = S_eff[:, k]
-                    a_NC = np.sum(Arel[idNC])
-
-                    constraints = []
-                    if np.any(idC):
-                        idC_nonzero = idC & (Arel > 0)
-                        if np.any(idC_nonzero):
-                            constraints.append(np.min(Srel[idC_nonzero] / Arel[idC_nonzero]))
-                    if np.any(idIMP):
-                        idIMP_nonzero = idIMP & (Arel > 0)
-                        if np.any(idIMP_nonzero):
-                            constraints.append(np.min((Srel[idIMP_nonzero] / Arel[idIMP_nonzero] + xcap0[k]) * IMPORTANT_INPUT_CAPACITY_WEIGHT))
-                    if a_NC > 0:
-                        constraints.append(np.sum(Srel[idNC] / a_NC))
-                    
-                    if constraints:
-                        xinp[k] = np.min(constraints)
-                    else:
-                        xinp[k] = np.inf
-                else:
-                    xinp[k] = np.inf
+                nonzero_inputs = A[:, k] > 0
+                if np.any(nonzero_inputs):
+                    input_capacity = np.divide(S[nonzero_inputs, k], A[nonzero_inputs, k], out=np.full(np.count_nonzero(nonzero_inputs), np.inf), where=A[nonzero_inputs, k] > 0)
+                    weights = A[nonzero_inputs, k]
+                    xinp[k] = self._ces_output_constraint(input_capacity, weights)
         else:
             raise ValueError(f"Unknown production function: {prod_f}. Supported: 'leontief', 'leontief.adapted', 'linear', 'ces'")
         
-        output_constraint = self.output_constraint_[:, t]
+        output_constraint = self._period_output_constraints(t)
         
         xcap = np.nan_to_num(xcap, nan=0.0, posinf=NUMERIC_LARGE, neginf=0.0)
         xinp = np.nan_to_num(xinp, nan=NUMERIC_LARGE, posinf=NUMERIC_LARGE, neginf=0.0)
@@ -602,9 +739,9 @@ class SingleRegionInputOutputModel:
     
     def apply_input_availability_shock(self, input_sector_label: str, time_period: int,
                                        reduction_pct: float) -> Tuple[int, float]:
-        """A reduction in effective availability for the given input sector and period is recorded. The shock is
-        stored in input_availability_shocks_ for use in production and order logic (e.g. to scale usable input
-        in that period). The input sector index and the reduction fraction are returned."""
+        """A supplier-side input-availability shock is recorded for the given sector and period.
+        The shock constrains the supplier's output capacity for that period so downstream shortages arise via
+        reduced deliveries and inventory drawdown rather than through deletion of downstream stocks."""
         if input_sector_label not in self.label_to_index:
             raise ValueError(f"Sector label '{input_sector_label}' not found. Available labels: {list(self.label_to_index.keys())[:10]}...")
         
@@ -655,8 +792,8 @@ class SingleRegionInputOutputModel:
     # --- Intermediate consumption, final consumption, inventory, accounting ---
     def intercons_Z(self, O: np.ndarray, d: np.ndarray, x: np.ndarray,
                     firm_priority: str, S: np.ndarray, t: int = None) -> np.ndarray:
-        """Actual intermediate deliveries Z are computed from orders O, demand d, output x, and inventories S according to firm_priority.
-        When rationing shocks are active (t in rationing_shocks_), deliveries from rationed suppliers are scaled proportionally."""
+        """Actual intermediate deliveries Z are computed from orders O, demand d, and output x according to supplier-side rationing.
+        Beginning-of-period inventories do not cap new receipts. When rationing shocks are active, deliveries from rationed suppliers are scaled proportionally."""
         if firm_priority == "no":
             s = np.divide(x, d, out=np.zeros_like(x), where=d!=0)
         else:
@@ -665,7 +802,7 @@ class SingleRegionInputOutputModel:
             s = np.minimum(1, s)
         s = np.clip(s, 0, 1)
         desired_Z = O * s[:, np.newaxis]
-        Z = np.minimum(desired_Z, S)
+        Z = desired_Z
         
         # Apply proportional rationing if active for this period
         if t is not None and t in self.rationing_shocks_:
@@ -673,7 +810,6 @@ class SingleRegionInputOutputModel:
                 capacity_pct = rationing_info['capacity_pct']
                 # Proportional rationing: scale all deliveries from this supplier by capacity_pct
                 Z[supplier_idx, :] = desired_Z[supplier_idx, :] * capacity_pct
-                Z[supplier_idx, :] = np.minimum(Z[supplier_idx, :], S[supplier_idx, :])
         
         return Z
     
@@ -706,7 +842,10 @@ class SingleRegionInputOutputModel:
     
     def inventory_S(self, x: np.ndarray, S: np.ndarray, Z: np.ndarray, A: np.ndarray) -> np.ndarray:
         """End-of-period inventories are updated from previous stock S, deliveries Z, and use A @ diag(x); non-negative values are returned."""
-        used_inputs = A @ np.diag(x)
+        x = np.nan_to_num(x, nan=0.0, posinf=NUMERIC_LARGE, neginf=0.0)
+        S = np.nan_to_num(S, nan=0.0, posinf=NUMERIC_LARGE, neginf=0.0)
+        Z = np.nan_to_num(Z, nan=0.0, posinf=NUMERIC_LARGE, neginf=0.0)
+        used_inputs = A * x[np.newaxis, :]
         res = S + Z - used_inputs
         return np.maximum(0, res)
 
@@ -716,14 +855,14 @@ class SingleRegionInputOutputModel:
         return x - intermediate_inputs - l - self.cap_share * x - self.tax_share * x - self.imp_share * x
 
     def savings_s(self, pi: np.ndarray, l: np.ndarray, c: np.ndarray, c_other_coef: float) -> float:
-        """Aggregate savings are computed from profits, labour income, consumption, and the other-expenditure coefficient."""
-        extraexpenditure = c_other_coef / (1 - c_other_coef) * np.sum(c)
-        return np.sum(pi) + np.sum(l) - np.sum(c) - extraexpenditure
+        """Aggregate savings are computed from household income net of consumption and other outlays."""
+        extraexpenditure = self._extra_household_expenditure(np.sum(c))
+        household_income = self._household_income(np.sum(l), np.sum(pi))
+        return household_income - np.sum(c) - extraexpenditure
 
     # --- Simulation (time loop) ---
     def run_model(self) -> Dict:
         """The model is simulated over all periods. A dictionary is returned with gross_output, gdp, and realised_consumption (time series)."""
-        t = 1
         s = np.zeros(self.TT)
         s[0] = self.savings_s(self.profits0, self.l0, self.c0, self.c_other_coef)
         pi_ = np.zeros((self.N, self.TT))
@@ -743,27 +882,15 @@ class SingleRegionInputOutputModel:
         S_tar = self.Z0 * self.n[np.newaxis, :]
         initial_inventory = np.array(S_tar, copy=True)
         S = [initial_inventory]
-        xcap_ = np.zeros((self.N, self.TT))
-        xcap_[:, 0] = self.x0
         initial_constraints = self.producing_x(self.prod_function, self.A_essential, self.x0, 
                                                l_, S[0], self.A, d_[:, 0], 0)['output.constraints']
         x_constraints = [initial_constraints]
         Cdt = np.zeros(self.TT)
         Cdt[0] = np.sum(self.c0)
-        binding_counts = np.zeros((self.TT, 4), dtype=np.int32)
-        initial_binding = np.argmin(initial_constraints, axis=1)
-        for k in range(4):
-            binding_counts[0, k] = np.count_nonzero(initial_binding == k)
-        diagnostics: List[Dict[str, Any]] = []
-        if self.diagnostics_enabled:
-            diagnostics.append({
-                'period': 0,
-                'inventory_level': float(np.sum(S[0])),
-                'inventory_target': float(np.sum(S_tar)),
-                'inventory_drawn': 0.0,
-                'binding_sectors': [],
-                'demand_gap': float(np.sum(np.maximum(0, d_[:, 0] - x_[:, 0])))
-            })
+        household_income_signal_ = np.zeros(self.TT)
+        household_income_ = np.zeros(self.TT)
+        household_income_signal_[0] = self._household_income(np.sum(self.l0), np.sum(self.profits0))
+        household_income_[0] = self._household_income(np.sum(self.l0), np.sum(self.profits0))
         
         gdp_series = np.zeros(self.TT)
         gdp_series[0] = float(np.sum(x_[:, 0] - np.sum(Z[0], axis=0) - self.imp_share * x_[:, 0]))
@@ -771,11 +898,14 @@ class SingleRegionInputOutputModel:
         for t in range(1, self.TT):
             new_l = self.hire_fire(t, l_, x_, self.delta_, x_constraints[t-1])
             l_[:, t] = new_l
-            with np.errstate(divide='ignore', invalid='ignore'):
-                xcap_[:, t] = np.divide(l_[:, t], l_[:, 0], out=np.full_like(l_[:, t], np.inf), where=l_[:, 0] != 0) * self.x0
-                xcap_[l_[:, 0] == 0, t] = np.inf
-            Cdt_new, cd_new = self.findemand_cd(t, self.theta_[:, t], Cdt[t-1], 
-                                               self.xi_[t], l_, self.epsilon_[t])
+            household_income_signal_[t] = self._household_income_signal_for_period(household_income_[t-1], self.xi_[t])
+            Cdt_new, cd_new = self.findemand_cd(
+                self.theta_[:, t],
+                Cdt[t-1],
+                self.xi_[t],
+                household_income_signal_[t],
+                self.epsilon_[t]
+            )
             Cdt[t] = Cdt_new
             cd_[:, t] = cd_new
             O.append(self.orders_O(self.A, d_[:, t-1], self.tau, S_tar, S[t-1]))
@@ -793,36 +923,27 @@ class SingleRegionInputOutputModel:
                                   l_, S[t-1], self.A, d_[:, t].copy(), t)
             x_[:, t] = prod['output']
             x_constraints.append(prod['output.constraints'])
-            binding_idx = np.argmin(x_constraints[t], axis=1)
-            for k in range(4):
-                binding_counts[t, k] = np.count_nonzero(binding_idx == k)
             
             Z.append(self.intercons_Z(O[t], d_[:, t], x_[:, t], self.firm_priority, S[t-1], t))
             c_[:, t] = self.finalcons_c(cd_[:, t], d_[:, t], x_[:, t], Z[t], self.firm_priority, t)
             new_S = self.inventory_S(x_[:, t], S[t-1], Z[t], self.A)
             S.append(new_S)
             pi_[:, t] = self.profit_pi(x_[:, t], Z[t], l_[:, t])
+            household_income_[t] = self._household_income(np.sum(l_[:, t]), np.sum(pi_[:, t]))
             s[t] = self.savings_s(pi_[:, t], l_[:, t], c_[:, t], self.c_other_coef)
-            if self.diagnostics_enabled:
-                binding_flags = np.isclose(x_[:, t], np.min(x_constraints[t], axis=1))
-                rationed_suppliers = []
-                if t in self.rationing_shocks_:
-                    rationed_suppliers = [self.sector_labels[idx] for idx in self.rationing_shocks_[t].keys()]
-                diagnostics.append({
-                    'period': t,
-                    'inventory_level': float(np.sum(new_S)),
-                    'inventory_target': float(np.sum(S_tar)),
-                    'inventory_drawn': float(np.sum(np.clip(S[t-1] - new_S, a_min=0, a_max=None))),
-                    'binding_sectors': [self.sector_labels[i] for i in np.where(binding_flags)[0].tolist()],
-                    'rationed_suppliers': rationed_suppliers,
-                    'demand_gap': float(np.sum(np.maximum(0, d_[:, t] - x_[:, t])))
-                })
             gdp_series[t] = float(np.sum(x_[:, t] - np.sum(Z[t], axis=0) - self.imp_share * x_[:, t]))
         
         return {
             'gross_output': x_,
             'gdp': gdp_series,
             'realised_consumption': c_,
+            'savings': s,
+            'household_income_signal': household_income_signal_,
+            'household_income': household_income_,
+            'household_closure_mode': self.household_closure_mode,
+            'inventories': np.stack(S, axis=2),
+            'orders': np.stack(O, axis=2),
+            'intermediate_deliveries': np.stack(Z, axis=2),
         }
 
     # --- Plotting ---
@@ -831,8 +952,8 @@ class SingleRegionInputOutputModel:
                     uncertainty_data: Dict = None) -> None:
         """Total output is plotted; if baseline_results is given, percentage change from baseline is shown. Uncertainty bands may be drawn from uncertainty_data. The figure is saved to save_path when provided."""
         fig, axes = plt.subplots(1, 1, figsize=(7.2, 8))
-        # Titles may be set here if required, e.g.:
-        #   fig.suptitle(title_suffix, fontsize=14)
+        if title_suffix:
+            fig.suptitle(title_suffix, fontsize=14)
         
         start_period = 0
         time_slice = slice(start_period, None)
@@ -1156,7 +1277,7 @@ class MonteCarloUncertaintyAnalysis:
         return self.results
 
     def _create_model_with_parameters(self, sampled_params: dict, simulation_idx: int) -> "SingleRegionInputOutputModel":
-        """A model instance is created from the base model's config and parameterised from the sampled values at the given simulation index. Sampled parameters overwrite the initialised values; _initialize_data() is not called again, so the savings-rate dimension and other sampled state are preserved."""
+        """A model instance is created from the base model's config and parameterised from the sampled values at the given simulation index."""
         model = SingleRegionInputOutputModel(
             n_periods=self.base_model.TT,
             time_frequency=self.base_model.time_frequency,
@@ -1172,13 +1293,7 @@ class MonteCarloUncertaintyAnalysis:
         if 'tau' in sampled_params:
             model.tau = sampled_params['tau'][:, simulation_idx]
         if 'savings_rate' in sampled_params:
-            model.savings_rate = sampled_params['savings_rate'][simulation_idx]
-            model.c0 = model.l0 * (1 - model.savings_rate)
-            denom = np.sum(model.c0)
-            if denom != 0:
-                for t in range(model.TT):
-                    model.theta_[:, t] = model.c0 / denom
-        # _initialize_data() is not called again so that savings_rate, c0, theta_, etc. are preserved.
+            model.savings_rate = model._validate_savings_rate_value(sampled_params['savings_rate'][simulation_idx])
 
         return model
 
@@ -1252,18 +1367,27 @@ class MonteCarloUncertaintyAnalysis:
 # -----------------------------------------------------------------------------
 # Example scenario runner
 # -----------------------------------------------------------------------------
-def run_consumption_shock_scenario(intensity: float = 0.2, duration: int = 3, start: int = 2, prod_function: str = "leontief"):
-    """An example consumption-shock scenario is run by setting epsilon_[t] for the given intensity, duration, and start period. The scenario run and the baseline run are returned. Not invoked from __main__ by default."""
-    manager = ScenarioManager(ModelConfig(n_periods=SIMULATION_PERIODS, time_frequency="daily", prod_function=prod_function))
+def run_consumption_shock_scenario(intensity: float = 0.2, duration: int = 3, start: int = 2,
+                                   prod_function: str = "leontief",
+                                   shock_spec: Optional[ConsumptionShockSpec] = None,
+                                   household_closure_mode: str = "return_to_base"):
+    """A consumption-shock scenario is run from an explicit shock spec or the provided arguments. By default this is the moderate example case."""
+    spec = _resolve_consumption_shock_spec(intensity, duration, start, shock_spec)
+    manager = ScenarioManager(ModelConfig(
+        n_periods=SIMULATION_PERIODS,
+        time_frequency="daily",
+        prod_function=prod_function,
+        household_closure_mode=household_closure_mode,
+    ))
     manager.run_baseline(force=True)
 
     def consumption_shock(model: SingleRegionInputOutputModel) -> None:
-        for t in range(start, min(start + duration, model.TT)):
-            model.epsilon_[t] = intensity
+        for t in range(spec.start, min(spec.start + spec.duration, model.TT)):
+            model.epsilon_[t] = spec.intensity
 
     scenario = Scenario(
         name="consumption_shock",
-        description=f"{intensity * 100:.0f}% consumption shock for {duration} periods",
+        description=f"{spec.intensity * 100:.0f}% consumption shock for {spec.duration} periods ({spec.tier})",
         config=manager.base_config.clone(),
         shocks=[consumption_shock]
     )
@@ -1278,21 +1402,74 @@ def _key_supplier_sector_label(model: "SingleRegionInputOutputModel") -> str:
     return model.sector_labels[idx]
 
 
-def run_input_availability_shock_scenario(input_sector_label: Optional[str] = None, reduction_pct: float = 0.6,
-                                          duration: int = 3, start: int = 2, prod_function: str = "leontief"):
-    """An input-availability shock scenario is run by reducing effective availability of the given input sector for the given duration and start period. The scenario run and the baseline run are returned. If input_sector_label is None, the key supplier sector (largest forward supply) is used so that the shock is likely to bind and production functions can differ."""
-    manager = ScenarioManager(ModelConfig(n_periods=SIMULATION_PERIODS, time_frequency="daily", prod_function=prod_function))
+def _resolve_consumption_shock_spec(
+    intensity: float,
+    duration: int,
+    start: int,
+    shock_spec: Optional[ConsumptionShockSpec],
+) -> ConsumptionShockSpec:
+    """A consumption-shock spec is resolved from either an explicit spec or the function arguments."""
+    if shock_spec is not None:
+        return shock_spec
+    return ConsumptionShockSpec(intensity=intensity, duration=duration, start=start, tier="example")
+
+
+def _resolve_input_availability_shock_spec(
+    reduction_pct: float,
+    duration: int,
+    start: int,
+    inventory_days: Optional[np.ndarray],
+    input_sector_label: Optional[str],
+    shock_spec: Optional[InputAvailabilityShockSpec],
+) -> InputAvailabilityShockSpec:
+    """An input-availability shock spec is resolved from either an explicit spec or the function arguments."""
+    if shock_spec is not None:
+        return shock_spec
+    return InputAvailabilityShockSpec(
+        reduction_pct=reduction_pct,
+        duration=duration,
+        start=start,
+        inventory_days=inventory_days,
+        input_sector_label=input_sector_label,
+        tier="example",
+    )
+
+
+def run_input_availability_shock_scenario(input_sector_label: Optional[str] = None,
+                                          reduction_pct: float = INPUT_SHOCK_DEFAULT_REDUCTION_PCT,
+                                          duration: int = INPUT_SHOCK_DEFAULT_DURATION,
+                                          start: int = INPUT_SHOCK_DEFAULT_START,
+                                          prod_function: str = "leontief",
+                                          inventory_days: Optional[np.ndarray] = INPUT_SHOCK_DEFAULT_INVENTORY_DAYS,
+                                          shock_spec: Optional[InputAvailabilityShockSpec] = None,
+                                          household_closure_mode: str = "return_to_base"):
+    """An input-availability shock scenario is run from an explicit shock spec or the provided arguments. By default this is the moderate example case, while the comparison helper uses a tighter stress spec."""
+    spec = _resolve_input_availability_shock_spec(
+        reduction_pct,
+        duration,
+        start,
+        inventory_days,
+        input_sector_label,
+        shock_spec,
+    )
+    manager = ScenarioManager(ModelConfig(
+        n_periods=SIMULATION_PERIODS,
+        time_frequency="daily",
+        prod_function=prod_function,
+        inventory_days=spec.inventory_days,
+        household_closure_mode=household_closure_mode,
+    ))
     manager.run_baseline(force=True)
     baseline_run = manager.run_baseline(force=False)
-    sector_label = input_sector_label if input_sector_label is not None else _key_supplier_sector_label(baseline_run.model)
+    sector_label = spec.input_sector_label if spec.input_sector_label is not None else _key_supplier_sector_label(baseline_run.model)
 
     def input_availability_shock(model: SingleRegionInputOutputModel) -> None:
-        for t in range(start, min(start + duration, model.TT)):
-            model.apply_input_availability_shock(sector_label, t, reduction_pct)
+        for t in range(spec.start, min(spec.start + spec.duration, model.TT)):
+            model.apply_input_availability_shock(sector_label, t, spec.reduction_pct)
 
     scenario = Scenario(
         name="input_availability_shock",
-        description=f"{reduction_pct * 100:.0f}% input-availability shock ({sector_label}) for {duration} periods",
+        description=f"{spec.reduction_pct * 100:.0f}% input-availability shock ({sector_label}) for {spec.duration} periods ({spec.tier})",
         config=manager.base_config.clone(),
         shocks=[input_availability_shock]
     )
@@ -1300,30 +1477,210 @@ def run_input_availability_shock_scenario(input_sector_label: Optional[str] = No
     return scenario_run, baseline_run
 
 
+def _resolve_household_closure_modes(closure_modes: Optional[List[str]]) -> List[str]:
+    """A validated list of household-closure modes is returned."""
+    modes = list(HOUSEHOLD_CLOSURE_MODES) if closure_modes is None else list(closure_modes)
+    invalid_modes = [mode for mode in modes if mode not in HOUSEHOLD_CLOSURE_MODES]
+    if invalid_modes:
+        raise ValueError(f"Unknown household closure modes: {invalid_modes}. Supported: {HOUSEHOLD_CLOSURE_MODES}")
+    return modes
+
+
+def _closure_mode_label(closure_mode: str) -> str:
+    """A presentation label for the given household closure mode is returned."""
+    return {
+        "return_to_base": "Return To Base",
+        "scarred": "Permanent Scarring",
+    }[closure_mode]
+
+
+def _plot_household_closure_comparison(results_data: Dict[str, Dict[str, Any]], save_path: Optional[str] = None) -> None:
+    """Scenario paths and Monte Carlo bands are plotted for each household closure mode."""
+    if not results_data:
+        logger.error("No closure-mode results to plot")
+        return
+
+    fig, axes = plt.subplots(1, 1, figsize=(7.2, 8))
+    colours = {
+        "return_to_base": "#1f77b4",
+        "scarred": "#d62728",
+    }
+    linestyles = {
+        "return_to_base": "-",
+        "scarred": "--",
+    }
+
+    first_mode = next(iter(results_data))
+    first_data = results_data[first_mode]
+    time = np.arange(first_data["model"].TT)
+
+    for closure_mode, data in results_data.items():
+        colour = colours.get(closure_mode, "#000000")
+        linestyle = linestyles.get(closure_mode, "-")
+        if data["uncertainty_data"] is not None:
+            data["model"]._plot_uncertainty_bands(
+                axes,
+                time,
+                data["uncertainty_data"],
+                data["baseline_results"],
+                data["scenario_results"],
+                colour=colour,
+            )
+        current_output = np.sum(data["scenario_results"]["gross_output"], axis=0)
+        baseline_output = np.sum(data["baseline_results"]["gross_output"], axis=0)
+        output_change = ((current_output / baseline_output) - 1) * 100
+        axes.plot(
+            time,
+            output_change,
+            color=colour,
+            linewidth=2.5,
+            linestyle=linestyle,
+            label=_closure_mode_label(closure_mode),
+        )
+
+    if first_data["model"].time_frequency == "daily":
+        axes.set_xlabel("Time Period (Days)")
+    elif first_data["model"].time_frequency == "quarterly":
+        axes.set_xlabel("Time Period (Quarters)")
+    else:
+        axes.set_xlabel("Time Period")
+    axes.xaxis.set_major_locator(plt.MaxNLocator(integer=True))
+    if time.size > 0:
+        axes.set_xlim(time[0], time[-1])
+    axes.set_ylabel("Percentage Change from Baseline (%)")
+    axes.grid(True, alpha=0.3)
+    axes.legend(loc="best")
+    axes.axhline(y=0, color="black", linestyle="--", alpha=0.5)
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches="tight")
+        logger.info("Figure saved: %s", save_path)
+    plt.show()
+
+
+def run_consumption_shock_household_closure_sensitivity(
+    intensity: float = 0.2,
+    duration: int = 3,
+    start: int = 2,
+    prod_function: str = "leontief",
+    closure_modes: Optional[List[str]] = None,
+    save_path: Optional[str] = None,
+    n_simulations: int = MC_PLOT_SIMULATIONS,
+) -> Dict[str, Dict[str, Any]]:
+    """The consumption shock is run for each household closure mode, with separate Monte Carlo bands for structural sensitivity."""
+    modes = _resolve_household_closure_modes(closure_modes)
+    results_data: Dict[str, Dict[str, Any]] = {}
+    for closure_mode in modes:
+        scenario_run, baseline_run = run_consumption_shock_scenario(
+            intensity=intensity,
+            duration=duration,
+            start=start,
+            prod_function=prod_function,
+            household_closure_mode=closure_mode,
+        )
+        mc_shock = MonteCarloUncertaintyAnalysis(baseline_run.model, n_simulations=n_simulations)
+        mc_shock.run_uncertainty_analysis(
+            shock_scenario="consumption",
+            shock_params={"intensity": intensity, "duration": duration, "start": start},
+            seed=42,
+        )
+        results_data[closure_mode] = {
+            "scenario_results": scenario_run.results,
+            "baseline_results": baseline_run.results,
+            "uncertainty_data": mc_shock.get_uncertainty_data_for_plotting(),
+            "model": scenario_run.model,
+        }
+
+    _plot_household_closure_comparison(results_data, save_path=save_path)
+    return results_data
+
+
+def run_input_availability_shock_household_closure_sensitivity(
+    input_sector_label: Optional[str] = None,
+    reduction_pct: float = INPUT_SHOCK_DEFAULT_REDUCTION_PCT,
+    duration: int = INPUT_SHOCK_DEFAULT_DURATION,
+    start: int = INPUT_SHOCK_DEFAULT_START,
+    prod_function: str = "leontief",
+    inventory_days: Optional[np.ndarray] = INPUT_SHOCK_DEFAULT_INVENTORY_DAYS,
+    shock_spec: Optional[InputAvailabilityShockSpec] = None,
+    closure_modes: Optional[List[str]] = None,
+    save_path: Optional[str] = None,
+    n_simulations: int = MC_PLOT_SIMULATIONS,
+) -> Dict[str, Dict[str, Any]]:
+    """The input-availability shock is run for each household closure mode, with separate Monte Carlo bands for structural sensitivity."""
+    spec = _resolve_input_availability_shock_spec(
+        reduction_pct,
+        duration,
+        start,
+        inventory_days,
+        input_sector_label,
+        shock_spec,
+    )
+    modes = _resolve_household_closure_modes(closure_modes)
+    results_data: Dict[str, Dict[str, Any]] = {}
+    sector_label = spec.input_sector_label
+
+    for closure_mode in modes:
+        scenario_run, baseline_run = run_input_availability_shock_scenario(
+            prod_function=prod_function,
+            shock_spec=InputAvailabilityShockSpec(
+                reduction_pct=spec.reduction_pct,
+                duration=spec.duration,
+                start=spec.start,
+                inventory_days=spec.inventory_days,
+                input_sector_label=sector_label,
+                tier=spec.tier,
+            ),
+            household_closure_mode=closure_mode,
+        )
+        if sector_label is None:
+            sector_label = _key_supplier_sector_label(baseline_run.model)
+        mc_shock = MonteCarloUncertaintyAnalysis(baseline_run.model, n_simulations=n_simulations)
+        mc_shock.run_uncertainty_analysis(
+            shock_scenario="input_availability",
+            shock_params={
+                "input_sector_label": sector_label,
+                "reduction_pct": spec.reduction_pct,
+                "duration": spec.duration,
+                "start": spec.start,
+            },
+            seed=42,
+        )
+        results_data[closure_mode] = {
+            "scenario_results": scenario_run.results,
+            "baseline_results": baseline_run.results,
+            "uncertainty_data": mc_shock.get_uncertainty_data_for_plotting(),
+            "model": scenario_run.model,
+        }
+
+    _plot_household_closure_comparison(results_data, save_path=save_path)
+    return results_data
+
+
 def run_consumption_shock_all_prod_functions(intensity: float = 0.2, duration: int = 3, start: int = 2,
-                                             save_path: str = None, n_simulations: int = MC_PLOT_SIMULATIONS):
+                                             save_path: str = None, n_simulations: int = MC_PLOT_SIMULATIONS,
+                                             household_closure_mode: str = "return_to_base"):
     """The consumption shock scenario is run for all production function settings with Monte Carlo uncertainty analysis, and results are plotted together in one figure using existing plotting functionality."""
     production_functions = ["leontief", "leontief.adapted", "linear", "ces"]
     results_data = {}
     time_frequency = None
-    first_model = None
     
     # The scenario is run for each production function
     for prod_func in production_functions:
         logger.debug("Running consumption shock scenario with production function: %s", prod_func)
         try:
             scenario_run, baseline_run = run_consumption_shock_scenario(
-                intensity=intensity, duration=duration, start=start, prod_function=prod_func
+                intensity=intensity, duration=duration, start=start, prod_function=prod_func,
+                household_closure_mode=household_closure_mode,
             )
             
-            # Production functions differ only when input availability (inventories) is the binding constraint.
+            # Production functions differ only when input availability becomes binding through the inventory channel.
             # With a consumption shock (reduced demand), demand becomes binding, so all production functions
             # produce identical results. This is expected behaviour; they should overlap in this scenario.
             
             # Time frequency and model are stored from the first successful run
             if time_frequency is None:
                 time_frequency = scenario_run.model.time_frequency
-                first_model = scenario_run.model
             
             # Monte Carlo uncertainty analysis is run
             logger.debug("Running Monte Carlo analysis for %s (%s simulations)", prod_func, n_simulations)
@@ -1421,26 +1778,44 @@ def run_consumption_shock_all_prod_functions(intensity: float = 0.2, duration: i
 
 
 def run_input_availability_shock_all_prod_functions(input_sector_label: Optional[str] = None,
-                                                     reduction_pct: float = 0.6, duration: int = 3,
-                                                     start: int = 2, save_path: str = None,
-                                                     n_simulations: int = MC_PLOT_SIMULATIONS):
-    """The input-availability shock scenario is run for all production function settings with Monte Carlo uncertainty analysis, and results are plotted together in one figure using existing plotting functionality. If input_sector_label is None, the key supplier sector (largest forward supply) is used."""
+                                                     reduction_pct: float = INPUT_SHOCK_STRESS_REDUCTION_PCT,
+                                                     duration: int = INPUT_SHOCK_STRESS_DURATION,
+                                                     start: int = INPUT_SHOCK_STRESS_START,
+                                                     inventory_days: Optional[np.ndarray] = INPUT_SHOCK_STRESS_INVENTORY_DAYS,
+                                                     save_path: str = None,
+                                                     n_simulations: int = MC_PLOT_SIMULATIONS,
+                                                     shock_spec: Optional[InputAvailabilityShockSpec] = None,
+                                                     household_closure_mode: str = "return_to_base"):
+    """The production-function comparison is run on a tighter stress-style input shock by default so substitution differences become visible rather than being hidden by generous inventories."""
+    spec = _resolve_input_availability_shock_spec(
+        reduction_pct,
+        duration,
+        start,
+        inventory_days,
+        input_sector_label,
+        shock_spec if shock_spec is not None else INPUT_AVAILABILITY_STRESS_SHOCK_SPEC,
+    )
     production_functions = ["leontief", "leontief.adapted", "linear", "ces"]
     results_data = {}
     time_frequency = None
-    sector_label = input_sector_label
+    sector_label = spec.input_sector_label
 
     # The scenario is run for each production function
     for prod_func in production_functions:
         logger.debug("Running input-availability shock scenario with production function: %s", prod_func)
         try:
             scenario_run, baseline_run = run_input_availability_shock_scenario(
-                input_sector_label=sector_label, reduction_pct=reduction_pct, duration=duration,
-                start=start, prod_function=prod_func
+                prod_function=prod_func,
+                shock_spec=InputAvailabilityShockSpec(
+                    reduction_pct=spec.reduction_pct,
+                    duration=spec.duration,
+                    start=spec.start,
+                    inventory_days=spec.inventory_days,
+                    input_sector_label=sector_label,
+                    tier=spec.tier,
+                ),
+                household_closure_mode=household_closure_mode,
             )
-            # Input availability is the binding constraint (key supplier shocked), so production functions differ.
-            # Linear may stay near baseline because it uses aggregate input (perfect substitution); one scarce input is diluted.
-            # Leontief.adapted and CES can match because both use the same essential-input bottleneck from A_essential.
             if sector_label is None:
                 sector_label = _key_supplier_sector_label(baseline_run.model)
 
@@ -1453,8 +1828,8 @@ def run_input_availability_shock_all_prod_functions(input_sector_label: Optional
             mc_shock = MonteCarloUncertaintyAnalysis(baseline_run.model, n_simulations=n_simulations)
             mc_shock.run_uncertainty_analysis(
                 shock_scenario="input_availability",
-                shock_params={'input_sector_label': sector_label, 'reduction_pct': reduction_pct,
-                              'duration': duration, 'start': start},
+                shock_params={'input_sector_label': sector_label, 'reduction_pct': spec.reduction_pct,
+                              'duration': spec.duration, 'start': spec.start},
                 seed=42
             )
             shock_uncertainty = mc_shock.get_uncertainty_data_for_plotting()
@@ -1537,17 +1912,99 @@ def run_input_availability_shock_all_prod_functions(input_sector_label: Optional
     plt.show()
 
 
+def run_input_availability_sensitivity_panel(input_sector_label: Optional[str] = None,
+                                             prod_function: str = "leontief",
+                                             save_path: Optional[str] = None) -> None:
+    """A small sensitivity panel is run for the input-availability shock so the moderate example is contextualised against a tighter stress case and higher-inventory variants."""
+    cases = [
+        {
+            'label': 'Stress Test (50%, 1 Day)',
+            'colour': '#2ca02c',
+            'linestyle': '-',
+            'reduction_pct': INPUT_SHOCK_STRESS_REDUCTION_PCT,
+            'inventory_days': INPUT_SHOCK_STRESS_INVENTORY_DAYS,
+        },
+        {
+            'label': 'Moderate Shock (30%, 1 Day)',
+            'colour': '#1f77b4',
+            'linestyle': '--',
+            'reduction_pct': INPUT_SHOCK_DEFAULT_REDUCTION_PCT,
+            'inventory_days': INPUT_SHOCK_STRESS_INVENTORY_DAYS,
+        },
+        {
+            'label': 'Stress + Buffer (50%, 5 Days)',
+            'colour': '#ff7f0e',
+            'linestyle': '-.',
+            'reduction_pct': INPUT_SHOCK_STRESS_REDUCTION_PCT,
+            'inventory_days': INPUT_SHOCK_DEFAULT_INVENTORY_DAYS,
+        },
+        {
+            'label': 'Moderate + Buffer (30%, 5 Days)',
+            'colour': '#d62728',
+            'linestyle': ':',
+            'reduction_pct': INPUT_SHOCK_DEFAULT_REDUCTION_PCT,
+            'inventory_days': INPUT_SHOCK_DEFAULT_INVENTORY_DAYS,
+        },
+    ]
+
+    fig, axes = plt.subplots(1, 1, figsize=(7.2, 8))
+    time = None
+    time_frequency = None
+    for case in cases:
+        scenario_run, baseline_run = run_input_availability_shock_scenario(
+            input_sector_label=input_sector_label,
+            reduction_pct=case['reduction_pct'],
+            duration=INPUT_SHOCK_DEFAULT_DURATION,
+            start=INPUT_SHOCK_DEFAULT_START,
+            prod_function=prod_function,
+            inventory_days=case['inventory_days'],
+        )
+        if time is None:
+            time = np.arange(scenario_run.model.TT)
+            time_frequency = scenario_run.model.time_frequency
+        current_output = np.sum(scenario_run.results['gross_output'], axis=0)
+        baseline_output = np.sum(baseline_run.results['gross_output'], axis=0)
+        output_change = ((current_output / baseline_output) - 1) * 100
+        axes.plot(
+            time,
+            output_change,
+            color=case['colour'],
+            linewidth=2.5,
+            linestyle=case['linestyle'],
+            label=case['label'],
+        )
+
+    if time_frequency == "daily":
+        axes.set_xlabel('Time Period (Days)')
+    elif time_frequency == "quarterly":
+        axes.set_xlabel('Time Period (Quarters)')
+    else:
+        axes.set_xlabel('Time Period')
+    axes.xaxis.set_major_locator(plt.MaxNLocator(integer=True))
+    if time is not None and time.size > 0:
+        axes.set_xlim(time[0], time[-1])
+    axes.set_ylabel('Percentage Change from Baseline (%)')
+    axes.grid(True, alpha=0.3)
+    axes.legend(loc='best')
+    axes.axhline(y=0, color='black', linestyle='--', alpha=0.5)
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        logger.info("Figure saved: %s", save_path)
+    plt.show()
+
+
 # -----------------------------------------------------------------------------
 # Entry point (when the file is run as the main script)
 # -----------------------------------------------------------------------------
 # A baseline scenario is executed with the default config (daily frequency,
-# Leontief production, diagnostics disabled). A small Monte Carlo uncertainty
+# Leontief production). A small Monte Carlo uncertainty
 # run is performed; when ENABLE_PLOTTING is True, total-output results are
 # plotted to figures/baseline.png and a single baseline GDP value is logged.
 # When run as main, only warnings and errors are logged to the terminal.
 if __name__ == "__main__":
     logging.getLogger().setLevel(logging.WARNING)
-    manager = ScenarioManager(ModelConfig(n_periods=SIMULATION_PERIODS, time_frequency="daily", prod_function="leontief", diagnostics=False))
+    manager = ScenarioManager(ModelConfig(n_periods=SIMULATION_PERIODS, time_frequency="daily", prod_function="leontief"))
     baseline_run = manager.run_baseline(force=True)
 
     figures_dir = Path("figures")
@@ -1570,11 +2027,30 @@ if __name__ == "__main__":
             save_path=str(figures_dir / "consumption_shock_all_prod_functions.png"),
             n_simulations=MC_PLOT_SIMULATIONS
         )
+        run_consumption_shock_household_closure_sensitivity(
+            intensity=0.2,
+            duration=3,
+            start=2,
+            prod_function="leontief",
+            save_path=str(figures_dir / "consumption_shock_household_closure_sensitivity.png"),
+            n_simulations=MC_PLOT_SIMULATIONS,
+        )
 
-    # Input-availability shock example: run for all production functions and plot together (may be disabled via ENABLE_INPUT_AVAILABILITY_SHOCK_PLOT)
+    # Input-availability comparison: use the stress-tier helper so production-function differences are visible
     if ENABLE_PLOTTING and ENABLE_INPUT_AVAILABILITY_SHOCK_PLOT:
         run_input_availability_shock_all_prod_functions(
-            input_sector_label=None, reduction_pct=0.6, duration=3, start=2,
+            input_sector_label=None,
             save_path=str(figures_dir / "input_availability_shock_all_prod_functions.png"),
             n_simulations=MC_PLOT_SIMULATIONS
+        )
+        run_input_availability_shock_household_closure_sensitivity(
+            input_sector_label=None,
+            prod_function="leontief",
+            save_path=str(figures_dir / "input_availability_shock_household_closure_sensitivity.png"),
+            n_simulations=MC_PLOT_SIMULATIONS,
+        )
+        run_input_availability_sensitivity_panel(
+            input_sector_label=None,
+            prod_function="leontief",
+            save_path=str(figures_dir / "input_availability_sensitivity_panel.png"),
         )
