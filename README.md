@@ -1,22 +1,18 @@
-# Dynamic Disequilibrium Input–Output Model
+# Dynamic Disequilibrium Model with Input-Output Structure
 
-A Python implementation of a simple single-region Dynamic Disequilibrium Input-Output (IO) model with multiple production rules, inventory dynamics, labour adjustment, and two shock types: a consumption shock and a supplier-side input-availability shock.
+A Python implementation of a Dynamic Disequilibrium [^d] Model with Input-Output Structure. It features multiple production rules, inventory dynamics, labour adjustment, multi-region support, endogenous macro closure rules, and two exemplary shock types.
+
+[^d]: Disequilibrium: persistent possibility of excess demand or supply, with quantity adjustment and rationing rather than instantaneous price-mediated market clearing.
 
 ## Overview
 
-In this setup of the Dynamic Disequilibrium[^d] IO model it is strictly single-region: one set of sectors, one technical-coefficient matrix, and one final-demand vector per period. It is discrete-time and sector-level. Production can be Leontief, adapted Leontief, linear, or CES. Inventories buffer production through beginning-of-period stocks and rebuild through a damped positive restocking rule rather than an unconstrained stock-gap correction. Labour adjusts gradually toward the output level implied by the previous period's non-labour constraints, subject to disruption and capacity bounds. Household demand is benchmark-consistent by construction: the no-shock baseline is an exact fixed point, demand is formed from a single lagged household-income concept, and savings are reported as an accounting outcome rather than fed back through an endogenous wealth-gap loop. When `savings_rate` is not supplied, the default rate is inferred from the observed base-year household accounts so the data-calibrated `cons_vec` remains the benchmark. The repository distinguishes between mild example shocks and tighter stress cases, especially for input-availability comparisons where structural differences between production rules only become visible when inventories are low enough for supply-chain bottlenecks to bind. Monte Carlo uncertainty analysis over parameter distributions is supported, and results can be plotted as total output or percentage change from baseline, with optional uncertainty bands. Theoretical underpinnings and data sources are described in references [1-5] below; reference 4 gives the data source and licence for the example inputs (EXIOBASE).
+The model uses an input-output table as its structural backbone but is best understood as a dynamic disequilibrium macroeconomic model: production is supply- and capacity-constrained, labour and inventories adjust with friction, and quantity rationing takes the place of price-mediated market clearing. It is discrete-time and sector-level. A multi-region structure with R ≥ 1 regions is supported. Production can be Leontief, adapted Leontief, linear, or CES. Household demand follows a Muellbauer or LES rule, whilst government spending and investment can follow endogenous macro closure rules or remain fixed at base-year levels. Full model equations and implementation details are in `docs/Mathematical_summary.pdf`.
 
-[^d]: Persistent possibility of excess demand or supply, with quantity adjustment and rationing rather than instantaneous price-mediated market clearing.
+## Modelling approach
 
-This project provides:
+Standard input-output analysis rests on the Leontief condition **x** = **Ax** + **f**, which requires markets to clear simultaneously through price adjustment. pyMacroIO does not impose this. Production at each period is the minimum of labour capacity, available inventories, and demand. Any shortfall is allocated by proportional rationing, whilst any surplus remains as idle capacity. Persistent gaps between supply and demand are the normal state, not a transient condition to be resolved.
 
-- **Core model**: `SingleRegionInputOutputModel` with configurable production (`leontief` / `leontief.adapted` / `linear` / `ces`), inventories, labour adjustment, selectable household closures, consumption shocks, and supplier-side input-availability shocks
-- **Scenarios**: `ScenarioManager`, `Scenario`, and `ScenarioRunResult` for baseline and shocked runs; comparison to baseline (GDP and realised consumption)
-- **Uncertainty**: `MonteCarloUncertaintyAnalysis` for parameter sampling, run ensembles, and metrics (mean, quantiles) for GDP, consumption, and gross output
-- **Configuration**: `ModelConfig` with validation (`n_periods` > 0, `time_frequency` in `"daily"` or `"quarterly"`)
-
-Further equations and implementation choices for the simple plain-vanilla single-region Dynamic Disequilibrium Input–Output (IO) model are documented in `docs/Mathematical_summary.pdf`.
-
+The period-*t* solution follows a fixed recursive sequence: given the state at the end of period *t* − 1, the model computes labour, household demand, intermediate orders, aggregate demand, production, deliveries, inventory update, and profits in that order, with no step within a period feeding back into an earlier one. The outcome is therefore determined by direct evaluation rather than by solving a simultaneous equation system. The Leontief inverse enters only at the calibration stage, where the column viability condition (all column sums of **A** strictly below one) ensures it exists, and this condition is verified at model initialisation.
 
 ## Requirements
 
@@ -24,138 +20,108 @@ Further equations and implementation choices for the simple plain-vanilla single
 - NumPy
 - Matplotlib
 
-No formal installation is required. The repository may be cloned or copied and the application run from the project root so that the data file is found (default: `data/example_data.pkl`; or `ModelConfig.data_path` may be set to the correct path). The example data are derived from a subset of EXIOBASE data (see References, item 4).
+No installation is required. Clone or copy the repository and run from the project root so that the default data file (`data/example_data.pkl`) is found, or set `ModelConfig.data_path` explicitly. Example data are derived from a subset of EXIOBASE (see References, item 4).
 
 ## Quick Start
 
-### Baseline run and plotting
+### Baseline run
 
 ```python
-from pathlib import Path
-from pyMacroIO import (
-    ModelConfig,
-    ScenarioManager,
-    MonteCarloUncertaintyAnalysis,
-    ENABLE_PLOTTING,
-)
+from pyMacroIO import ModelConfig, ScenarioManager, MonteCarloUncertaintyAnalysis
 
 config = ModelConfig(
-    n_periods=30,
+    n_periods=60,
     time_frequency="daily",
-    prod_function="leontief",  # Explicit example choice; the library default is "leontief.adapted".
-    savings_rate=0.05,
+    prod_function="leontief.adapted",   # default; also "leontief", "linear", "ces"
 )
 manager = ScenarioManager(config)
 baseline_run = manager.run_baseline(force=True)
-
-figures_dir = Path("figures")
-figures_dir.mkdir(parents=True, exist_ok=True)
-
-mc = MonteCarloUncertaintyAnalysis(baseline_run.model, n_simulations=50)
-mc.run_uncertainty_analysis(shock_scenario="baseline", seed=42)
-uncertainty = mc.get_uncertainty_data_for_plotting()
-
-if ENABLE_PLOTTING:
-    baseline_run.model.plot_results(
-        baseline_run.results,
-        baseline_results=None,
-        title_suffix="(Daily Baseline)",
-        save_path=str(figures_dir / "baseline.png"),
-        uncertainty_data=uncertainty,
-    )
 ```
 
 ### Consumption-shock scenario
 
 ```python
-from pyMacroIO import run_consumption_shock_scenario
+from pyMacroIO import run_consumption_shock_scenario, ScenarioManager
 
 scenario_run, baseline_run = run_consumption_shock_scenario(
-    intensity=0.2,
-    duration=3,
-    start=2,
+    intensity=0.2, duration=3, start=2,
 )
-
-# Percentage deviation from baseline
-from pyMacroIO import ScenarioManager
 comparison = ScenarioManager.compare_to_baseline(scenario_run, baseline_run)
 # comparison["gdp_pct"], comparison["consumption_pct"]
 ```
 
-### Input-availability shock scenario
+### Input-availability shock
 
 ```python
 from pyMacroIO import run_input_availability_shock_scenario
 
-# Key supplier sector is used when input_sector_label is None.
-# This helper is the moderate example case.
 scenario_run, baseline_run = run_input_availability_shock_scenario(
-    input_sector_label=None,
+    input_sector_label=None,   # uses key supplier (largest forward supply)
     reduction_pct=0.3,
     duration=3,
     start=2,
     inventory_days=5.0,
 )
-# run_input_availability_shock_all_prod_functions(...) uses a tighter stress case by default
-# so the production rules separate for structural reasons rather than because of plotting noise.
 ```
 
-## Documentation
+### Endogenous macro closures
 
-- **Mathematical summary**: `docs/Mathematical_summary.pdf` describes the model equations, data calibration, adapted-Leontief essential-input identification, production blocks, inventories, labour, household closure, and shock semantics.
+```python
+from pyMacroIO import ModelConfig, ScenarioManager
+
+config = ModelConfig(
+    n_periods=60,
+    gov_income_elasticity=-0.3,        # counter-cyclical government spending
+    investment_closure="keynesian",     # scales investment with lagged savings
+)
+manager = ScenarioManager(config)
+baseline_run = manager.run_baseline(force=True)
+```
 
 ## Key Features
 
-### Core model
+**Core model**
 
-- **SingleRegionInputOutputModel**: single-region Dynamic Disequilibrium IO model with Leontief / adapted Leontief / linear / CES production
-- **ModelConfig**: Scenario-overridable parameters with validation (`n_periods`, `time_frequency`, `prod_function`, etc.)
-- **Inventories**: Target levels and adjustment speed `tau`; beginning-of-period stocks constrain production and end-of-period stocks rebuild from realised deliveries net of input use with damped positive restocking
-- **Labour**: Hiring and firing with sector-specific speeds and capacity bounds; labour moves toward the output level implied by yesterday's non-labour constraints
-- **Households**: Two closure modes are available. `return_to_base` is benchmark-anchored and removes permanent demand scarring from temporary shocks. `scarred` uses lagged realised income and allows persistent demand scars. Ex post savings are reported in both cases.
+- `InputOutputModel`: R ≥ 1 regions, production functions `leontief`, `leontief.adapted`, `linear`, `ces`
+- `ModelConfig`: all scenario-overridable parameters with validation
+- Inventories: beginning-of-period stocks constrain production; end-of-period stocks rebuild from realised deliveries with a damped positive restocking rule
+- Labour: sector-specific hiring and firing speeds, disruption, and capacity bounds
+- Household demand: Muellbauer rule or LES (`subsistence_shares`); closure modes `return_to_base`, `scarred`, `frozen`; LES calibration via `build_subsistence_shares_vector`
+- Government spending: income-indexed with elasticity `gov_income_elasticity` (default 0.0 holds spending at the base-year level)
+- Investment closure: `investment_closure="keynesian"` scales investment demand with lagged aggregate savings; default `"fixed"` holds it at base year
+- Technical change: piecewise-constant productivity events
 
-### Scenarios and shocks
+**Trade closures**
 
-- **ScenarioManager**: Baseline run (cached), scenario run with shock callables, comparison to baseline
-- **Consumption shock (example)**: Scenarios apply it by setting `model.epsilon_[t]` over a start period and duration (e.g. via `run_consumption_shock_scenario`). When demand is the binding constraint, all production functions should coincide.
-- **Input-availability shock**: The output capacity of a chosen supplier sector is reduced by a fraction over a duration (e.g. via `run_input_availability_shock_scenario`). The example helper uses a moderate `30%` shock with `5` days of inventory cover. The all-production-function comparison helper defaults to a tighter stress specification (`50%`, `1` day) so `leontief`, `leontief.adapted`, `ces`, and `linear` separate because of their production logic. When `input_sector_label` is not specified, the key supplier sector (largest forward supply) is used. Downstream shortages arise through reduced deliveries and inventory drawdown rather than by directly reducing downstream stocks.
-- **Household-closure sensitivity**: `run_consumption_shock_household_closure_sensitivity(...)` and `run_input_availability_shock_household_closure_sensitivity(...)` overlay `return_to_base` and `scarred` closures with separate Monte Carlo bands, so structural uncertainty is shown explicitly rather than folded into one envelope.
-- **Overrides**: Expectations (\(\xi\)) and labour disruption (\(\delta\)) may be set via overrides on `model.xi_` and `model.delta_`; for a baseline or unshocked run they remain at defaults.
+- Import flexibility (`import_flexibility`): per-sector fraction of an inventory shortfall coverable by external imports
+- Sourced supplement (`row_supply_cap`): caps the share of RoW output diverted to source the import supplement
+- Export pull (`export_pull`): absorbs capacity slack as additional external demand
 
-### Uncertainty
+**Scenarios and uncertainty**
 
-- **MonteCarloUncertaintyAnalysis**: Parameter distributions, sampling, run ensemble, and metrics (mean, std, quantiles) for GDP, consumption, and gross output; integration with `plot_results` for uncertainty bands. Uncertainty bands reflect parameter uncertainty only.
+- `ScenarioManager`: cached baseline, scenario runs with shock callables, comparison to baseline
+- Shock helpers: `run_consumption_shock_scenario`, `run_input_availability_shock_scenario`, `run_consumption_shock_all_prod_functions`, `run_input_availability_shock_all_prod_functions`, household-closure sensitivity variants, and `run_input_availability_sensitivity_panel`
+- `MonteCarloUncertaintyAnalysis`: parameter sampling, ensemble runs, mean and quantile metrics for GDP, consumption, and gross output
 
-## Data
+## Example data
 
-The default data file is a Python pickle (`data/example_data.pkl`) containing base-year IO and final-demand data. The following entries must be included: `sector_labels` (list of sector names), `Z0` (inter-industry flows, square matrix \(N\times N\)), `cons_vec`, `gov_vec`, `inv_vec`, `invnt_vec`, `exp_vec` (final-demand vectors of length \(N\)), `l0`, `cap0`, `tax0`, `imp0` (value-added components, length \(N\)), and `consumer_taxes_total`, `fd_imports_totals`. ROW and value-added identities are assumed and checked at load. Gross output is derived from the row identity. Definitions are given in `docs/Mathematical_summary.pdf` (Data and Parameter Calibration). The example data are derived from a subset of EXIOBASE data (see References, item 4).
+The default data file is `data/example_data.pkl` (single region) or `data/example_data_2region.pkl` (two-region example). Required entries: `sector_labels`, `Z0` (N×N intermediate flows), `cons_vec`, `gov_vec`, `inv_vec`, `invnt_vec`, `exp_vec` (final-demand vectors), `l0`, `cap0`, `tax0`, `imp0` (value-added components), `consumer_taxes_total`, `fd_imports_totals`. Multi-region datasets additionally include `region_map` and `region_labels`. Row and value-added identities are checked at load. Full definitions are in `docs/Mathematical_summary.pdf`. Example data are derived from EXIOBASE (see References, item 4).
 
-## Outputs
+## Documentation
 
-- **figures/baseline.png**: Total output (or absolute values) for the baseline run; optional uncertainty bands (parameter uncertainty) when `uncertainty_data` is passed to `plot_results`.
-- **figures/consumption_shock_all_prod_functions.png**: Percentage change from baseline for the consumption-shock scenario, all production functions in one plot; optional uncertainty bands (parameter uncertainty).
-- **figures/consumption_shock_household_closure_sensitivity.png**: Consumption-shock comparison of `return_to_base` and `scarred` household closures for a chosen production function, with separate uncertainty bands for each closure.
-- **figures/input_availability_shock_all_prod_functions.png**: Percentage change from baseline for the stress-tier input-availability comparison (key supplier reduced), all production functions in one plot; optional uncertainty bands (parameter uncertainty). Produced when `ENABLE_INPUT_AVAILABILITY_SHOCK_PLOT` is `True`.
-- **figures/input_availability_shock_household_closure_sensitivity.png**: Input-shock comparison of `return_to_base` and `scarred` household closures for a chosen production function, with separate uncertainty bands for each closure.
-- **figures/input_availability_sensitivity_panel.png**: Leontief sensitivity panel comparing the stress case against milder-shock and higher-inventory variants, so the moderate example is not treated as the whole story.
-
-These figures are produced when the main script is run with `ENABLE_PLOTTING` set to `True`:
-
-```bash
-python3 pyMacroIO.py
-```
+`docs/Mathematical_summary.pdf` covers all main model equations.
 
 ## Licence
 
-The licence for this software is described in the LICENSE file. The licence for the example data is different; the full terms are specified by the data source. See [4] and the [EXIOBASE licence file](https://zenodo.org/records/15689391/preview/LICENSE.txt) for the authoritative conditions.
+The licence for this software is described in the LICENSE file. The example data licence is different; see [4] and the [EXIOBASE licence file](https://zenodo.org/records/15689391/preview/LICENSE.txt) for the authoritative conditions.
 
 ### How to cite
 
-This implementation should be cited as: [0], building on [1–3]; [4] should also be cited when the included example data (a small subset of EXIOBASE) are used. The licence thereof must also be adhered to (see Licence section above).
+Cite this implementation as [0], building on [1–3]. Cite [4] when the included example data (a subset of EXIOBASE) are used, and adhere to its licence terms.
 
 ## References
 
-0. Ross, A. G. (2025). A Python implementation of a single-region Dynamic Disequilibrium Input–Output model. [10.5281/zenodo.18419984](https://doi.org/10.5281/zenodo.18419984)  
+0. Ross, A. G. (2025). A Python implementation of a single-region Dynamic Disequilibrium Input–Output model. [10.5281/zenodo.18419984](https://doi.org/10.5281/zenodo.18419984)
 
 1. Pichler, A., Pangallo, M., del Rio-Chanona, R. M., Lafond, F., & Farmer, J. D. (2022). Forecasting the propagation of pandemic shocks with a dynamic input–output model. *Journal of Economic Dynamics and Control*, 144, 104527. <https://doi.org/10.1016/j.jedc.2022.104527>
 
@@ -166,4 +132,3 @@ This implementation should be cited as: [0], building on [1–3]; [4] should als
 4. Stadler, K., Wood, R., Bulavskaya, T., Södersten, C.-J., Simas, M., Schmidt, S., Usubiaga, A., Acosta-Fernández, J., Kuenen, J., Bruckner, M., Giljum, S., Lutter, S., Merciai, S., Schmidt, J. H., Theurl, M. C., Plutzar, C., Kastner, T., Eisenmenger, N., Erb, K.-H., … Tukker, A. (2025). EXIOBASE 3 (3.9.6) [Data set]. Zenodo. <https://doi.org/10.5281/zenodo.15689391>
 
 5. Miller, R. E., & Blair, P. D. (2009). Input-output analysis: foundations and extensions. Cambridge university press.
-
