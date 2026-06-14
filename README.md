@@ -8,12 +8,6 @@ A Python implementation of a Dynamic Disequilibrium [^d] Model with Input-Output
 
 The model uses an input-output table as its structural backbone but is best understood as a dynamic disequilibrium macroeconomic model: production is supply- and capacity-constrained, labour and inventories adjust with friction, and quantity rationing takes the place of price-mediated market clearing. It is discrete-time and sector-level. A multi-region structure with R ≥ 1 regions is supported. Production can be Leontief, adapted Leontief, linear, or CES. Household demand follows a Muellbauer or LES rule, whilst government spending and investment can follow endogenous macro closure rules or remain fixed at base-year levels. Full model equations and implementation details are in `docs/Mathematical_summary.pdf`.
 
-## Modelling approach
-
-Standard input-output analysis rests on the Leontief condition **x** = **Ax** + **f**, which requires markets to clear simultaneously. pyMacroIO does not impose this. Production at each period is the minimum of labour capacity, available inventories, and demand. Any shortfall is allocated by proportional rationing, whilst any surplus remains as idle capacity. Persistent gaps between supply and demand are the normal state, not a transient condition to be resolved.
-
-The period-*t* solution follows a fixed recursive sequence: given the state at the end of period *t* − 1, the model computes labour, household demand, intermediate orders, aggregate demand, production, deliveries, inventory update, and profits in that order, with no step within a period feeding back into an earlier one. The outcome is therefore determined by direct evaluation rather than by solving a simultaneous equation system. The Leontief inverse enters only at the calibration stage, where the column viability condition (all column sums of **A** strictly below one) ensures it exists, and this condition is verified at model initialisation.
-
 ## Requirements
 
 - Python 3.8+
