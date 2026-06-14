@@ -164,6 +164,24 @@ def estimate_essential_inputs_from_io_data(
     return A_essential
 
 
+class ConvergenceAbort(Exception):
+    """Raised inside run_model() when a step_callback signals divergence.
+
+    Attributes
+    ----------
+    t_step      : int    time step at which the abort was triggered
+    region_idx  : int    index of the first offending region
+    value       : float  the diverging metric value that tripped the threshold
+    """
+    def __init__(self, t_step: int, region_idx: int, value: float):
+        self.t_step     = t_step
+        self.region_idx = region_idx
+        self.value      = value
+        super().__init__(
+            f"Divergence at t={t_step}: region {region_idx} value={value:.1f}"
+        )
+
+
 # Core model
 class InputOutputModel:
     """Dynamic Disequilibrium Input-Output model (single- or multi-region).
@@ -234,6 +252,11 @@ class InputOutputModel:
         self.investment_closure = config.investment_closure
         self.investment_adj_speed = float(config.investment_adj_speed)
         self.investment_savings_ema = float(config.investment_savings_ema)
+        self.investment_scale_growth_cap = config.investment_scale_growth_cap
+        self.price_passthrough_enabled = bool(config.price_passthrough_enabled)
+        self.price_passthrough_pos     = float(config.price_passthrough_pos)
+        self.price_passthrough_neg     = float(config.price_passthrough_neg)
+        self.price_deflate_household_income = bool(config.price_deflate_household_income)
         self.n_regions = config.n_regions
 
         self.prod_function      = config.prod_function
@@ -852,12 +875,23 @@ class InputOutputModel:
         # epsilon_r is (R, TT); epsilon_ is a convenience view into row 0.
         self.epsilon_r = np.zeros((self.n_regions, self.TT))
         self.epsilon_  = self.epsilon_r[0]
+        # Exogenous real-income stream (R, TT), added to household income each
+        # period; default zero. 
+        self.income_spillover_r = np.zeros((self.n_regions, self.TT))
         self.xi_       = np.ones(self.TT)
         self.output_constraint_        = np.full((self.N, self.TT), np.inf)
         self.input_availability_shocks_: dict[int, dict] = {}
         self.rationing_shocks_:          dict[int, dict] = {}
         # Technical-change events: {t: new_A (N,N)}.
         self.A_changes: dict[int, np.ndarray] = {}
+
+        # Direct unit-cost shocks for price pass-through, each active over a window:
+        # list of {"sector", "delta", "start", "end"}.
+        self.price_cost_shocks_: list[dict] = []
+        self.L_price_pos = None
+        self.L_price_neg = None
+        if self.price_passthrough_enabled:
+            self.L_price_pos, self.L_price_neg = self._build_price_inverses(self.A)
 
         self._set_household_baseline(cons_agg)
         self._set_per_region_baselines(cons_vec)
@@ -915,7 +949,7 @@ class InputOutputModel:
         self._klems_m_idx  = np.where(m_mask)[0]
         self._klems_nd_idx = np.where(nd_mask)[0]
 
-        # ---- E sub-aggregate weights (n_E, N) ----
+        # E sub-aggregate weights (n_E, N)
         # w_E[i, j] = A[e_i, j] / sum_e(A[e, j])  (normalised within column)
         A_E      = self.A[e_mask, :]                   # (n_E, N)
         e_colsum = A_E.sum(axis=0)                     # (N,)
@@ -923,24 +957,24 @@ class InputOutputModel:
         self.klems_w_E   = A_E / e_safe[np.newaxis, :] # (n_E, N)
         self._klems_has_e = e_colsum > 0               # (N,) bool
 
-        # ---- M sub-aggregate weights (n_M, N) ----
+        # M sub-aggregate weights (n_M, N)
         A_M      = self.A[m_mask, :]                   # (n_M, N)
         m_colsum = A_M.sum(axis=0)                     # (N,)
         m_safe   = np.where(m_colsum > 0, m_colsum, 1.0)
         self.klems_w_M   = A_M / m_safe[np.newaxis, :] # (n_M, N)
         self._klems_has_m = m_colsum > 0               # (N,) bool
 
-        # ---- ND flag ----
+        # ND flag
         nd_colsum         = self.A[nd_mask, :].sum(axis=0) if nd_mask.any() else np.zeros(self.N)
         self._klems_has_nd = nd_colsum > 0             # (N,) bool
 
-        # ---- KL sub-aggregate weights ----
+        # KL sub-aggregate weights
         kl_total = self.l0 + self.cap0                 # (N,)
         kl_safe  = np.where(kl_total > 0, kl_total, 1.0)
         self.klems_w_L = self.l0  / kl_safe            # (N,)
         self.klems_w_K = self.cap0 / kl_safe           # (N,)
 
-        # ---- Top-level KLE weights ----
+        # Top-level KLE weights
         # Value shares relative to gross output: KL from factor income,
         # E and M from intermediate-input coefficients.
         x0_safe  = np.where(self.x0 > 0, self.x0, 1.0)
@@ -951,11 +985,11 @@ class InputOutputModel:
         self.klems_w_E_top  = e_colsum  / kle_safe     # (N,)
         self.klems_w_M_top  = m_colsum  / kle_safe     # (N,)
 
-        # ---- Skill-tier weights for L sub-aggregate (3, N) ----
+        # Skill-tier weights for L sub-aggregate (3, N)
         l0_safe = np.where(self.l0 > 0, self.l0, 1.0)
         self.klems_w_skill = self.l0_by_skill / l0_safe[np.newaxis, :]  # (3, N)
 
-        # ---- Per-sector sigma vectors ----
+        # Per-sector sigma vectors
         self.klems_sigma_e_vec = self._expand_sector_parameter(
             np.atleast_1d(np.asarray(self.config.klems_sigma_e,   dtype=float)),
             0.5, "klems_sigma_e",
@@ -977,7 +1011,7 @@ class InputOutputModel:
             1.5, "klems_sigma_l",
         )
 
-        # ---- Pre-computed CES branch data (fixed for the model lifetime) ----
+        # Pre-computed CES branch data (fixed for the model lifetime)
         # Avoids repeated np.isclose and (sigma-1)/sigma in the producing_x hot path.
         def _cd_rho(sigma_v):
             cd  = np.isclose(sigma_v, 1.0)
@@ -989,7 +1023,7 @@ class InputOutputModel:
         self._klems_m_cd,   self._klems_m_rho,   self._klems_m_any_cd,   self._klems_m_all_cd   = _cd_rho(self.klems_sigma_m_vec)
         self._klems_kle_cd, self._klems_kle_rho, self._klems_kle_any_cd, self._klems_kle_all_cd = _cd_rho(self.klems_sigma_kle_vec)
 
-        # ---- Pre-computed weight presence masks ----
+        # Pre-computed weight presence masks
         self._klems_w_L_pos    = self.klems_w_L      > 0  # (N,)
         self._klems_w_K_pos    = self.klems_w_K      > 0  # (N,)
         self._klems_kl_zero    = ~self._klems_w_L_pos & ~self._klems_w_K_pos
@@ -997,7 +1031,7 @@ class InputOutputModel:
         self._klems_w_E_tp_pos = self.klems_w_E_top  > 0  # (N,)
         self._klems_w_M_tp_pos = self.klems_w_M_top  > 0  # (N,)
 
-        # ---- Pre-extracted A slices for E, M, ND (base-year A; consistent with weights) ----
+        # Pre-extracted A slices for E, M, ND (base-year A; consistent with weights)
         # Avoids repeated array indexing and np.where of fixed arrays in the hot path.
         def _a_slice(idx):
             if len(idx) == 0:
@@ -1022,6 +1056,7 @@ class InputOutputModel:
         fprod_l_t: np.ndarray | None = None,
         U_r_prev: np.ndarray | None = None,
         U_r_0: np.ndarray | None = None,
+        desired_l_out: np.ndarray | None = None,
     ) -> np.ndarray:
         """Update labour for period t using hiring/firing speeds and capacity slack.
 
@@ -1031,6 +1066,8 @@ class InputOutputModel:
         required for wage_curve=True, ignored otherwise.
         """
         if not self.hiringfiring:
+            if desired_l_out is not None:
+                desired_l_out[:] = l_[:, t - 1]
             return l_[:, t - 1]
 
         lbase = l_ref_t if l_ref_t is not None else l_[:, 0]
@@ -1066,6 +1103,8 @@ class InputOutputModel:
             labor_share = labor_share * w_adj
         desired_output = np.min(prod_constraints[:, 1:4], axis=1)
         desired_l      = np.clip(labor_share * desired_output, min_capacity, upper_capacity)
+        if desired_l_out is not None:
+            desired_l_out[:] = desired_l
         gap            = desired_l - l_[:, t - 1]
         hire_ix        = gap > 0
         gam            = np.where(hire_ix, self.gamma_hire, self.gamma_fire * FIRING_SPEED_DAMPING)
@@ -1323,7 +1362,7 @@ class InputOutputModel:
 
             # All _klems_* quantities below are pre-computed at initialisation.
 
-            # --- KL bundle ---
+            # KL bundle
             # xcap (= xcap_L) already computed above from l_[:,t] / l_[:,0].
             xcap_K = xcap0 * fprod_k_eff
             rho_kl = self._klems_kl_rho        # pre-computed (N,)
@@ -1353,7 +1392,7 @@ class InputOutputModel:
             KL_j = np.where(self._klems_kl_zero, np.maximum(xcap, xcap_K), KL_j)
             kl_f = np.where(np.isfinite(KL_j), KL_j, 0.0)  # pre-clamp inf for KLE
 
-            # --- E and M CES sub-aggregates ---
+            # E and M CES sub-aggregates
             # _ces processes both eff and ns in one call using pre-computed nz/A_safe/rho/cd.
             def _ces(nz, A_safe, w, rho, cd, any_cd, all_cd, has_grp, S_e, S_n):
                 if nz.shape[0] == 0:
@@ -1392,14 +1431,14 @@ class InputOutputModel:
                 self._klems_has_m, S_eff[m_rows, :], S[m_rows, :],
             )
 
-            # --- KLE top-level CES ---
+            # KLE top-level CES
             rho_kle  = self._klems_kle_rho
             w_KL_top = self.klems_w_KL_top
             w_E_top  = self.klems_w_E_top
             w_M_top  = self.klems_w_M_top
 
             def _kle(e, m):
-                # E/M are inf iff has_e/has_m is False — use pre-computed masks,
+                # E/M are inf iff has_e/has_m is False, use pre-computed masks,
                 # not np.isfinite, to zero absent-input terms without re-inspection.
                 e_f = np.where(self._klems_has_e, e, 0.0)
                 m_f = np.where(self._klems_has_m, m, 0.0)
@@ -1428,7 +1467,7 @@ class InputOutputModel:
             KLE_j    = _kle(E_j,    M_j)
             KLE_j_ns = _kle(E_j_ns, M_j_ns)
 
-            # --- ND Leontief ---
+            # ND Leontief
             nd_rows = self._klems_nd_idx
             if self._klems_nd_nz.shape[0] > 0:
                 q_nd_eff = np.where(self._klems_nd_nz, S_eff[nd_rows, :] / self._klems_A_nd_safe, np.inf)
@@ -1538,6 +1577,62 @@ class InputOutputModel:
             self.input_availability_shocks_[time_period] = {}
         self.input_availability_shocks_[time_period][input_sector_idx] = reduction_pct
         return input_sector_idx, reduction_pct
+
+    def _build_price_inverses(self, A: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Cost-push Leontief inverses for upward and downward pass-through.
+
+        Each inverse is (I - A*passthrough)^-1, so the price update p = L.T @ v
+        embeds the direct own-cost term and own-sector loops. Scaling A by the
+        pass-through fraction tunes how much network amplification is retained.
+        """
+        _I = np.eye(self.N)
+        try:
+            L_pos = np.linalg.inv(_I - A * self.price_passthrough_pos)
+            L_neg = np.linalg.inv(_I - A * self.price_passthrough_neg)
+        except np.linalg.LinAlgError as exc:
+            raise ValueError(
+                "Price pass-through requires (I - A*passthrough) to be invertible. "
+                "The input-output matrix appears non-productive."
+            ) from exc
+        return L_pos, L_neg
+
+    def apply_price_cost_shock(
+        self, sector_label: str, time_period: int, delta_cost: float,
+        duration: int | None = None,
+    ) -> tuple[int, float]:
+        """Record a direct unit-cost shock on a sector over a time window.
+
+        delta_cost is a fraction of base unit cost: positive raises cost,
+        negative lowers it, and must exceed -1 so prices stay positive. The shock
+        is active for duration periods from time_period (duration=None keeps it
+        active to the end of the horizon, a permanent level shift). Active shocks
+        enter the cost-push price update when price pass-through is enabled.
+        Returns (sector_idx, delta_cost).
+        """
+        if sector_label not in self.label_to_index:
+            raise ValueError(
+                f"Sector label '{sector_label}' not found. "
+                f"Available labels: {list(self.label_to_index.keys())[:10]}..."
+            )
+        sector_idx = self.label_to_index[sector_label]
+        if time_period < 0 or time_period >= self.TT:
+            raise ValueError(f"Time period {time_period} out of range [0, {self.TT-1}]")
+        if delta_cost <= -1.0:
+            raise ValueError(f"delta_cost must exceed -1; got {delta_cost}")
+        if duration is not None and (duration != int(duration) or duration < 1):
+            raise ValueError(f"duration must be a positive integer when given; got {duration}")
+        end = self.TT if duration is None else min(time_period + int(duration), self.TT)
+        # Overwrite any existing shock on this sector and start, matching the
+        # overwrite semantics of the other shock setters.
+        self.price_cost_shocks_ = [
+            _s for _s in self.price_cost_shocks_
+            if not (_s["sector"] == sector_idx and _s["start"] == time_period)
+        ]
+        self.price_cost_shocks_.append({
+            "sector": sector_idx, "delta": float(delta_cost),
+            "start": time_period, "end": end,
+        })
+        return sector_idx, float(delta_cost)
 
     def apply_rationing_shock(
         self,
@@ -1804,12 +1899,19 @@ class InputOutputModel:
 
     # Simulation loop
     def run_model(
-        self, store_full_matrices: bool = False, validate: bool = False
+        self,
+        store_full_matrices: bool = False,
+        validate: bool = False,
+        step_callback=None,
     ) -> dict:
         """Simulate the model over all TT periods and return a results dict.
 
         store_full_matrices: include (N,N,TT) stacks of inventories/orders/deliveries.
         validate: run post-run accounting checks.
+        step_callback: optional callable ``f(t, gdp_r_t, gdp_r_0) -> None``.
+            Called after each time step with the current regional GDP vector and
+            the t=0 baseline.  Should raise ``ConvergenceAbort`` if the draw
+            should be abandoned immediately (no return value is checked).
         """
         s    = np.zeros(self.TT)
         pi_  = np.zeros((self.N, self.TT)); pi_[:, 0] = self.profits0
@@ -1818,6 +1920,8 @@ class InputOutputModel:
         cd_  = np.zeros((self.N, self.TT)); cd_[:, 0] = self.c0
         c_   = np.zeros((self.N, self.TT)); c_[:, 0]  = self.c0
         l_   = np.zeros((self.N, self.TT)); l_[:, 0]  = self.l0
+        # Price index per sector, 1.0 at t=0 numeraire, stays flat when disabled.
+        p_   = np.ones((self.N, self.TT))
 
         R = self.n_regions
         Cdt_r                  = np.zeros((R, self.TT))
@@ -1893,8 +1997,10 @@ class InputOutputModel:
                 )
             u_sched = self.unemployment_schedule
 
-        Z_colsum_ = np.zeros((self.N, self.TT))
+        Z_colsum_  = np.zeros((self.N, self.TT))
         Z_colsum_[:, 0] = np.sum(self.Z0, axis=0)
+        desired_l_ = np.zeros((self.N, self.TT))
+        desired_l_[:, 0] = self.l0   # at t=0 desired = actual (no gap by construction)
 
         # Per-period (N, TT) trackers; zero unless the corresponding config field opts in.
         import_supplement_          = np.zeros((self.N, self.TT))  # using-side cost
@@ -1929,6 +2035,9 @@ class InputOutputModel:
                     )
                 else:
                     A_essential_current = None
+                # Rebuild price inverses so pass-through tracks the new structure.
+                if self.price_passthrough_enabled:
+                    self.L_price_pos, self.L_price_neg = self._build_price_inverses(A_current)
 
             if t in self.fprod_changes:
                 for _j, (_pL, _pK) in self.fprod_changes[t].items():
@@ -1941,6 +2050,7 @@ class InputOutputModel:
                 l_ref_t=l_ref[:, t], fprod_l_t=fprod_l_cur,
                 U_r_prev=u_sched[:, t - 1] if u_sched is not None else None,
                 U_r_0=u_sched[:, 0]        if u_sched is not None else None,
+                desired_l_out=desired_l_[:, t],
             )
 
             # Consumption demand (per-region loop)
@@ -1949,6 +2059,14 @@ class InputOutputModel:
                 household_income_sig_r[r, t] = self._household_income_signal_for_period_r(
                     r, household_income_r[r, t - 1], self.xi_[t]
                 )
+                if self.price_passthrough_enabled and self.price_deflate_household_income:
+                    # Deflate by last period's regional price index to give real
+                    # income, lagged to avoid within-period circularity. Dividing
+                    # by the weight sum keeps the index at 1.0 in the base period
+                    # regardless of theta normalisation.
+                    _w = self.theta_r[r][:, t - 1]
+                    P_r_prev = float(_w @ p_[:, t - 1]) / max(float(_w.sum()), 1e-12)
+                    household_income_sig_r[r, t] /= max(P_r_prev, 1e-9)
                 Cdt_new, cd_new = self._findemand_cd_regional(
                     r, t, Cdt_r[r, t - 1], household_income_sig_r[r, t]
                 )
@@ -1979,6 +2097,9 @@ class InputOutputModel:
                 alpha = self.investment_adj_speed
                 inv_scale = _inv_scale_prev + alpha * (target_scale - _inv_scale_prev)
                 inv_scale = max(inv_scale, 0.0)
+                _cap = self.investment_scale_growth_cap
+                if _cap is not None and _inv_scale_prev > 0:
+                    inv_scale = min(inv_scale, _inv_scale_prev * (1.0 + _cap))
                 _inv_scale_prev = inv_scale
                 inv_fd_t = self.inv_agg_base * inv_scale
             else:
@@ -2021,6 +2142,23 @@ class InputOutputModel:
             imp_supp_mat             = prod["import_supplement_matrix"]
             import_supplement_[:, t]          = imp_supp_mat.sum(axis=0)
             import_supplement_by_input_[:, t] = imp_supp_mat.sum(axis=1)
+
+            # Cost-push price level from the unit-cost shocks active this period.
+            # Upward and downward changes use separate inverses for asymmetric
+            # network amplification. Inactive shocks drop out, so the level
+            # returns to base once a finite window closes. Left at 1.0 when off.
+            if self.price_passthrough_enabled:
+                v = np.zeros(self.N)
+                for _sh in self.price_cost_shocks_:
+                    if _sh["start"] <= t < _sh["end"]:
+                        v[_sh["sector"]] += _sh["delta"]
+                v_pos = np.where(v > 0.0, v, 0.0)
+                v_neg = np.where(v < 0.0, v, 0.0)
+                # A large or stacked negative shock can propagate the index to
+                # zero or below, so floor it at a small positive value.
+                p_[:, t] = np.maximum(
+                    1.0 + self.L_price_pos.T @ v_pos + self.L_price_neg.T @ v_neg, 1e-6
+                )
 
             # Source supplement from RoW's matching sector, capped at row_supply_cap * x.
             if (
@@ -2072,7 +2210,7 @@ class InputOutputModel:
             for r in range(R):
                 household_income_r[r, t] = self._household_income_r(
                     r, float(_l_r_t[r]), float(_pi_r_t[r])
-                )
+                ) + float(self.income_spillover_r[r, t])
 
             savings_r[:, t] = self.savings_s_regional(household_income_r[:, t], c_r[:, t])
             s[t] = float(np.sum(savings_r[:, t]))
@@ -2098,6 +2236,9 @@ class InputOutputModel:
             trade_balance_r[:, t] = _exp_t.sum(axis=1) - _exp_t.sum(axis=0)
             gdp_series[t] = float(np.sum(gdp_r_series[:, t]))
 
+            if step_callback is not None:
+                step_callback(t, gdp_r_series[:, t], gdp_r_series[:, 0])
+
             if store_full_matrices:
                 S_list.append(S_prev.copy())
                 O_list.append(O_curr)
@@ -2106,6 +2247,8 @@ class InputOutputModel:
         result = {
             "gross_output":              x_,              # (N, TT)
             "labour_compensation":       l_,              # (N, TT) dynamic wage bill from hire_fire
+            "desired_l":                 desired_l_,      # (N, TT) target employment from hire_fire (same units as labour_compensation)
+            "Z_colsums":                 Z_colsum_,       # (N, TT) total intermediate input per sector (always computed)
             "gdp":                       gdp_series,      # (TT,)
             "realised_consumption":      c_,              # (N, TT)
             "savings":                   s,               # (TT,)
@@ -2121,6 +2264,7 @@ class InputOutputModel:
             "import_supplement_by_input": import_supplement_by_input_,  # (N, TT) by input good
             "row_export_supplement":      row_export_supplement_,       # (N, TT)
             "export_pull_supplement":     export_pull_supplement_,      # (N, TT)
+            "price_index":                p_,              # (N, TT), 1.0 at t=0, flat when disabled
         }
         if store_full_matrices:
             result["inventories"]             = np.stack(S_list, axis=2)

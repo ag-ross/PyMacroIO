@@ -100,6 +100,7 @@ from .scenarios import (
 # Core model
 from .model import (
     InputOutputModel,
+    ConvergenceAbort,
     estimate_essential_inputs_from_io_data,
 )
 
@@ -130,6 +131,8 @@ from .plotting import (
 )
 
 __all__ = [
+    # Exceptions
+    "ConvergenceAbort",
     # Config
     "ModelConfig",
     "build_subsistence_shares_vector",

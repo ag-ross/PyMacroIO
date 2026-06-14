@@ -75,6 +75,9 @@ class ModelConfig:
     # EMA weight on the savings signal before computing inv_scale (0 < w <= 1).
     # 1.0 = no smoothing; lower values smooth over multiple periods.
     investment_savings_ema: float = 1.0
+    # Maximum per-period growth rate of inv_scale (e.g. 0.01 = 1%/period cap).
+    # None = uncapped. Prevents runaway compounding over long horizons.
+    investment_scale_growth_cap: float | None = None
 
     # KLEMS production structure (active only when prod_function="klems").
     # Defaults are calibration midpoints; the project overrides per sector.
@@ -94,6 +97,20 @@ class ModelConfig:
     # Wage floor as fraction of base-year wage; only meaningful when wage_curve=True.
     # Accepts a scalar (uniform floor) or per-sector (N,) array (sector-specific calibration).
     wage_floor_ratio: float | np.ndarray | None = None
+
+    # Optional price pass-through propagates unit-cost shocks through the
+    # cost-push Leontief inverse of A. The switch defaults off, so default
+    # behaviour is unchanged, and on its own it only reports price_index.
+    price_passthrough_enabled: bool = False
+    # Fraction of network amplification passed through, separately for upward
+    # and downward cost changes, asymmetric by default. The direct own-cost
+    # term is always present at full strength.
+    price_passthrough_pos: float = 1.0
+    price_passthrough_neg: float = 0.5
+    # Optional coupling that deflates the household income signal by the
+    # regional price index, so price rises erode real consumption. Requires
+    # price_passthrough_enabled.
+    price_deflate_household_income: bool = False
 
     def __post_init__(self) -> None:
         """Validate all fields; raise ValueError on invalid input."""
@@ -122,6 +139,14 @@ class ModelConfig:
         _ep = np.atleast_1d(np.asarray(self.export_pull, dtype=float))
         if not np.all((_ep >= 0) & (_ep <= 1)):
             raise ValueError(f"export_pull must be in [0, 1] for all sectors; got {self.export_pull}")
+        for _pt_name in ("price_passthrough_pos", "price_passthrough_neg"):
+            _pt_val = float(getattr(self, _pt_name))
+            if not (0.0 <= _pt_val <= 1.0):
+                raise ValueError(f"{_pt_name} must be in [0, 1]; got {_pt_val}")
+        if self.price_deflate_household_income and not self.price_passthrough_enabled:
+            raise ValueError(
+                "price_deflate_household_income requires price_passthrough_enabled=True"
+            )
         _ss = np.atleast_1d(np.asarray(self.subsistence_shares, dtype=float))
         if not np.all((_ss >= 0) & (_ss < 1)):
             raise ValueError(f"subsistence_shares must be in [0, 1) for all sectors; got {self.subsistence_shares}")
