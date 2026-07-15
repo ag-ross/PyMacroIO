@@ -4,7 +4,10 @@ import numpy as np
 import numpy.testing as npt
 import pytest
 
+from types import SimpleNamespace
+
 from pyMacroIO.model import estimate_essential_inputs_from_io_data
+from pyMacroIO.config import build_subsistence_shares_vector
 from pyMacroIO.constants import NUMERIC_LARGE
 
 
@@ -19,6 +22,9 @@ _A3 = np.array(
     dtype=np.float64,
 )
 
+# Gross output vector matching _A3 (conftest Z0/x0).
+_X3 = np.array([60.0, 40.0, 40.0], dtype=np.float64)
+
 # Backward-linkage chain; sector 0 backward linkage exceeds 1.5× the mean.
 _A4_BACK_CHAIN = np.array(
     [
@@ -30,7 +36,7 @@ _A4_BACK_CHAIN = np.array(
     dtype=np.float64,
 )
 
-# Forward-linkage chain; sector 3 forward linkage exceeds 1.5× the mean.
+# Forward-linkage chain; sector 0 Ghosh forward linkage exceeds 1.5× the mean.
 _A4_FWD_CHAIN = np.array(
     [
         [0.0, 0.95, 0.0,  0.0 ],
@@ -117,7 +123,9 @@ class TestEstimateEssentialInputs:
 
     def test_combined_linkage_produces_non_trivial_result_for_heterogeneous_a(self):
         """The combined_linkage method marks at least one entry for a heterogeneous A matrix."""
-        result = estimate_essential_inputs_from_io_data(_A3, method="combined_linkage")
+        result = estimate_essential_inputs_from_io_data(
+            _A3, method="combined_linkage", x0=_X3
+        )
         assert result.sum() >= 1, (
             "combined_linkage should mark at least one entry."
         )
@@ -125,12 +133,16 @@ class TestEstimateEssentialInputs:
     def test_combined_linkage_uniform_diagonal_a_gives_all_zeros(self):
         """A diagonal A matrix gives all-zero output from combined_linkage."""
         A_diag = np.diag([0.1, 0.1, 0.1])
-        result = estimate_essential_inputs_from_io_data(A_diag, method="combined_linkage")
+        result = estimate_essential_inputs_from_io_data(
+            A_diag, method="combined_linkage", x0=np.ones(3)
+        )
         npt.assert_array_equal(result, np.zeros_like(A_diag, dtype=int))
 
     def test_combined_linkage_output_shape_and_dtype(self):
         """The combined_linkage method returns an array of the same shape as the input."""
-        result = estimate_essential_inputs_from_io_data(_A3, method="combined_linkage")
+        result = estimate_essential_inputs_from_io_data(
+            _A3, method="combined_linkage", x0=_X3
+        )
         assert result.shape == _A3.shape
         assert result.dtype in (np.int32, np.int64, np.int_, int, np.intp)
 
@@ -145,7 +157,9 @@ class TestEstimateEssentialInputs:
 
     def test_forward_linkage_method_output_shape_and_dtype(self):
         """The forward_linkage method returns a binary array with at least one marked entry."""
-        result = estimate_essential_inputs_from_io_data(_A4_FWD_CHAIN, method="forward_linkage")
+        result = estimate_essential_inputs_from_io_data(
+            _A4_FWD_CHAIN, method="forward_linkage", x0=np.ones(4)
+        )
         assert result.shape == _A4_FWD_CHAIN.shape
         assert set(np.unique(result)).issubset({0, 1})
         assert result.sum() > 0, (
@@ -186,7 +200,7 @@ class TestEstimateEssentialInputs:
         A_singular = np.eye(3, dtype=np.float64)
         expected = estimate_essential_inputs_from_io_data(A_singular, "value")
         for method in ("linkage", "forward_linkage", "elasticity", "combined_linkage"):
-            result = estimate_essential_inputs_from_io_data(A_singular, method)
+            result = estimate_essential_inputs_from_io_data(A_singular, method, x0=np.ones(3))
             npt.assert_array_equal(
                 result,
                 expected,
@@ -309,3 +323,86 @@ class TestOrdersO:
         A, d, tau, S_tar, S = _make_orders_arrays()
         result = minimal_model.orders_O(A, d, tau, S_tar, S)
         assert result.shape == A.shape
+
+
+# TestCombinedLinkageConvention
+class TestCombinedLinkageConvention:
+    """Pin combined_linkage to Ghosh forward x Rasmussen backward."""
+
+    def test_combined_linkage_uses_ghosh_forward_and_rasmussen_backward(self):
+        result = estimate_essential_inputs_from_io_data(
+            _A3, method="combined_linkage", x0=_X3
+        )
+        expected = np.array(
+            [[0, 1, 1],
+             [0, 0, 1],
+             [0, 0, 0]],
+            dtype=np.int64,
+        )
+        npt.assert_array_equal(result, expected)
+
+    def test_differs_from_old_symmetric_variants(self):
+        """Both degenerate variants (backward- and forward-squared) must differ."""
+        result = estimate_essential_inputs_from_io_data(
+            _A3, method="combined_linkage", x0=_X3
+        )
+        old_backward_squared = np.array(
+            [[0, 0, 0],
+             [0, 0, 1],
+             [0, 1, 0]],
+            dtype=np.int64,
+        )
+        old_forward_squared = np.array(
+            [[0, 1, 0],
+             [1, 0, 0],
+             [0, 0, 0]],
+            dtype=np.int64,
+        )
+        assert not np.array_equal(result, old_backward_squared)
+        assert not np.array_equal(result, old_forward_squared)
+
+    def test_linkage_methods_require_x0(self):
+        """combined_linkage and forward_linkage raise ValueError without x0."""
+        for method in ("combined_linkage", "forward_linkage"):
+            with pytest.raises(ValueError, match="x0"):
+                estimate_essential_inputs_from_io_data(_A3, method=method)
+
+
+# TestBuildSubsistenceShares
+class TestBuildSubsistenceShares:
+    """Tests for config.build_subsistence_shares_vector."""
+
+    @staticmethod
+    def _stub(labels):
+        return SimpleNamespace(N=len(labels),
+                               label_to_index={s: i for i, s in enumerate(labels)})
+
+    def test_table_matching_fallback_and_region_prefix(self):
+        model = self._stub(["DE:Fishing", "DE:Air transport",
+                            "DE:Real estate activities", "DE:Widget frobnication"])
+        shares = build_subsistence_shares_vector(model, frisch=-3.0)
+        npt.assert_allclose(
+            shares,
+            [1 - 0.60 / 3, 1 - 1.40 / 3, 1 - 0.35 / 3, 1 - 1.0 / 3],
+            rtol=1e-12,
+        )
+
+    def test_longest_substring_match_wins(self):
+        model = self._stub(["Air transport by drone"])
+        shares = build_subsistence_shares_vector(
+            model, frisch=-3.0,
+            sector_elasticities={"transport": 2.0, "air transport": 1.4},
+        )
+        npt.assert_allclose(shares, [1 - 1.4 / 3], rtol=1e-12)
+
+    def test_shares_clipped_at_095(self):
+        model = self._stub(["Fishing"])
+        shares = build_subsistence_shares_vector(
+            model, frisch=-3.0, sector_elasticities={"Fishing": 0.05}
+        )
+        npt.assert_allclose(shares, [0.95], rtol=1e-12)
+
+    def test_nonnegative_frisch_raises(self):
+        from pyMacroIO.config import build_subsistence_shares_vector
+        with pytest.raises(ValueError, match="frisch"):
+            build_subsistence_shares_vector(self._stub(["Fishing"]), frisch=0.5)
