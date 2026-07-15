@@ -57,6 +57,7 @@ def estimate_essential_inputs_from_io_data(
     method: str = "combined_linkage",
     value_threshold: float = 0.05,
     top_n: int = 3,
+    x0: np.ndarray | None = None,
 ) -> np.ndarray:
     """Estimate an essential-input indicator matrix from the IO coefficient matrix.
 
@@ -64,10 +65,12 @@ def estimate_essential_inputs_from_io_data(
     value             : inputs whose share >= value_threshold are essential.
     top_n             : the top-n inputs by coefficient value are essential.
     linkage           : sectors with above-average backward linkage are essential.
-    forward_linkage   : sectors with above-average forward linkage are essential.
-    combined_linkage  : combined forward × backward linkage score (default).
+    forward_linkage   : sectors with above-average Ghosh forward linkage are essential.
+    combined_linkage  : Ghosh forward × Rasmussen backward linkage score (default).
     elasticity        : Leontief-multiplier elasticity criterion.
     combined          : weighted combination of value, linkage, and elasticity.
+
+    x0 (gross output) is required for forward_linkage and combined_linkage.
 
     Used when prod_function is "leontief.adapted".
     """
@@ -96,10 +99,13 @@ def estimate_essential_inputs_from_io_data(
             return estimate_essential_inputs_from_io_data(A_matrix, "value")
 
     elif method == "forward_linkage":
+        if x0 is None:
+            raise ValueError("forward_linkage requires the gross output vector x0")
         try:
             I = np.eye(N)
-            G = np.linalg.inv(I - A_matrix.T)
-            forward_linkage = G.sum(axis=1)
+            L = np.linalg.inv(I - A_matrix)
+            # Ghosh inverse row sums: G = x_hat^-1 L x_hat, so G.sum(1) = (L @ x0) / x0.
+            forward_linkage = (L @ x0) / x0
             norm = forward_linkage / (forward_linkage.mean() + 1e-10)
             for j in range(N):
                 A_essential[:, j] = (norm > 1.5).astype(int)
@@ -107,12 +113,14 @@ def estimate_essential_inputs_from_io_data(
             return estimate_essential_inputs_from_io_data(A_matrix, "value")
 
     elif method == "combined_linkage":
+        if x0 is None:
+            raise ValueError("combined_linkage requires the gross output vector x0")
         try:
             I = np.eye(N)
             L = np.linalg.inv(I - A_matrix)
-            G = np.linalg.inv(I - A_matrix.T)
             norm_backward = L.sum(axis=0) / (L.sum(axis=0).mean() + 1e-10)
-            norm_forward  = G.sum(axis=1) / (G.sum(axis=1).mean() + 1e-10)
+            forward       = (L @ x0) / x0
+            norm_forward  = forward / (forward.mean() + 1e-10)
             combined      = np.outer(norm_forward, norm_backward)
             # Gate on coefficient share too; the linkage outer product alone
             # marks trace coefficients as essential in dense MRIO networks.
@@ -138,10 +146,10 @@ def estimate_essential_inputs_from_io_data(
         try:
             I = np.eye(N)
             L = np.linalg.inv(I - A_matrix)
-            G = np.linalg.inv(I - A_matrix.T)
             value_imp    = A_matrix / (A_matrix.sum(axis=0) + 1e-10)
             norm_backward = L.sum(axis=0) / (L.sum(axis=0).mean() + 1e-10)
-            norm_forward  = G.sum(axis=1) / (G.sum(axis=1).mean() + 1e-10)
+            forward       = (L @ x0) / x0 if x0 is not None else L.sum(axis=1)
+            norm_forward  = forward / (forward.mean() + 1e-10)
             linkage_imp  = np.outer(norm_forward, norm_backward)
             elast_imp    = A_matrix * L.T
             score = (
@@ -303,7 +311,7 @@ class InputOutputModel:
         """Initialise A_essential from the IO matrix when prod_function is leontief.adapted."""
         if self.prod_function == "leontief.adapted":
             self.A_essential = estimate_essential_inputs_from_io_data(
-                self.A, method="combined_linkage"
+                self.A, method="combined_linkage", x0=self.x0
             )
         else:
             self.A_essential = None
@@ -2031,7 +2039,7 @@ class InputOutputModel:
                 S_tar     = A_current * self.x0[np.newaxis, :] * self.n[np.newaxis, :]
                 if self.prod_function == "leontief.adapted":
                     A_essential_current = estimate_essential_inputs_from_io_data(
-                        A_current, method="combined_linkage"
+                        A_current, method="combined_linkage", x0=self.x0
                     )
                 else:
                     A_essential_current = None
